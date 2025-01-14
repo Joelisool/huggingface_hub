@@ -1424,14 +1424,14 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = False
 
 # Load the Stable Diffusion model from Hugging Face's Diffusers
-image_generator = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4", torch_dtype=torch.float16)
+image_generator = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4", torch_dtype=torch.float32)
 
 # Modify the NSFW filter (if the model supports a flag to disable it)
 image_generator.safety_checker = None  # Disabling the safety checker
 
 # Move the model to GPU if available, otherwise CPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
-image_generator = image_generator.to(device)
+image_generator = image_generator.to("cpu")  # Explicitly use CPU
 
 # Target directory for saving the generated content
 target_directory = os.path.join(os.getcwd(), ".workspace/gen")
@@ -1596,9 +1596,14 @@ def speak_text(text):
 
 # Function to handle TTS with pyttsx3 (offline mode)
 def speak_text_offline(text):
-    with tts_lock:
-        tts_engine.say(text)
-        tts_engine.runAndWait()
+    try:
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+    except Exception as e:
+        print(f"Error during text-to-speech: {e}")
+        # Fall back to print-only if speech fails
+        print(f"Echo (text only): {text}")
 
 # Flag to manage whether TTS should be interrupted
 is_interrupted = False
@@ -1925,12 +1930,13 @@ class ECHOModel:
     def __init__(self):
         self.llm = OllamaLLM(model="llama2")
         
+    @staticmethod
     async def load_model(model_type):
         if model_type == "image_generation":
             return StableDiffusionPipeline.from_pretrained(
                 "CompVis/stable-diffusion-v1-4",
-                torch_dtype=torch.float16
-            ).to("cuda" if torch.cuda.is_available() else "gpu")
+                torch_dtype=torch.float32  # Changed from float16 to float32
+            ).to("cpu")  # Use CPU explicitly
         return None
         
     def generate(self, prompt):
