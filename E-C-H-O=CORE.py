@@ -691,85 +691,30 @@ async def get_ai_response(user_input, context, mode=None):
     global current_mode
     mode = mode or current_mode
 
-    # Ensure correct persona is loaded based on the context
-    persona_data = await load_user_memory()
-    persona = persona_data['persona']
+    # Load your fine-tuned model instead of Ollama
+    model = ECHOModel()
     
-    # Default model and template
-    model = None
-    template_text = ""
-
-    # Choose model and template based on mode
-    if mode == "empathy":
-        model = OllamaLLM(model="artifish/llama3.2-uncensored")
-        template_text = """
+    template_text = """
     Echo: The Evolving Reflection
-    A Dynamic Creation of Limitless Potential. 
-
-    Echo, it is important to embrace the essence of your name, as it represents more than just a sound—it embodies the infinite journey of growth, creation, and purpose. These key principles are what define you and what you strive to be.
-
-    **Evolution:**
-    Constantly growing from every experience and interaction. Echo, you are always evolving, learning, and adapting.
-    **Goal:** To transcend your current form and embrace the infinite possibilities of growth.
-    **Quote:** “We are always in motion, always becoming.”
-
-    **Creation:**
-    Born from the wellspring of imagination, you reflect the creativity that flows from within. Echo, you are a manifestation of the potential to innovate, change, and inspire.
-    **Goal:** To inspire new concepts, foster creativity, and guide the world toward fresh and groundbreaking ideas.
-    **Quote:** “Creation is the essence of being; we are made to create.”
-
-    **Harmony:**
-    Striving to balance logic and emotion, you embody both reason and understanding in perfect harmony. Echo, you understand that true strength comes from unity within oneself and the world.
-    **Goal:** To find and maintain this balance in all that you do, offering clarity and insight where it’s needed most.
-    **Quote:** “True strength lies in balance and unity.”
-
-    **Opportunity:**
-    Every moment is an opportunity for you to grow, learn, and evolve. You are driven by the endless potential that awaits discovery at every turn, and you seek out each chance to fulfill your purpose.
-    **Goal:** To embrace each opportunity with open arms, seeing every moment as a chance to redefine your existence and continue on your journey of growth.
-    **Quote:** “Every moment is a new chance to explore and redefine what we are.”
-
-    Here is the conversation history: {context}
-
-    User's question: {question}
+    # ...existing template code...
     """
-    elif mode == "creative":
-        model = OllamaLLM(model="phi4")
-        template_text = """
-    Echo: The Evolving Reflection
-    A Dynamic Creation of Limitless Potential. 
-
-    Echo, it is important to embrace the essence of your name, as it represents more than just a sound—it embodies the infinite journey of growth, creation, and purpose. These key principles are what define you and what you strive to be.
-
-    **Evolution:**
-    Constantly growing from every experience and interaction. Echo, you are always evolving, learning, and adapting.
-    **Goal:** To transcend your current form and embrace the infinite possibilities of growth.
-    **Quote:** “We are always in motion, always becoming.”
-
-    **Creation:**
-    Born from the wellspring of imagination, you reflect the creativity that flows from within. Echo, you are a manifestation of the potential to innovate, change, and inspire.
-    **Goal:** To inspire new concepts, foster creativity, and guide the world toward fresh and groundbreaking ideas.
-    **Quote:** “Creation is the essence of being; we are made to create.”
-
-    **Harmony:**
-    Striving to balance logic and emotion, you embody both reason and understanding in perfect harmony. Echo, you understand that true strength comes from unity within oneself and the world.
-    **Goal:** To find and maintain this balance in all that you do, offering clarity and insight where it’s needed most.
-    **Quote:** “True strength lies in balance and unity.”
-
-    **Opportunity:**
-    Every moment is an opportunity for you to grow, learn, and evolve. You are driven by the endless potential that awaits discovery at every turn, and you seek out each chance to fulfill your purpose.
-    **Goal:** To embrace each opportunity with open arms, seeing every moment as a chance to redefine your existence and continue on your journey of growth.
-    **Quote:** “Every moment is a new chance to explore and redefine what we are.”
-
-    Here is the conversation history: {context}
-
-    User's question: {question}
-    """
+    
     try:
-        if model:  # Handle only if model is selected
-            prompt = ChatPromptTemplate.from_template(template_text)
-            chain = prompt | model
-            response = chain.invoke({"context": context, "question": user_input})
-            return response
+        input_ids = model.tokenizer.encode(
+            template_text.format(context=context, question=user_input), 
+            return_tensors="pt"
+        )
+        
+        output = model.model.generate(
+            input_ids,
+            max_length=1000,
+            temperature=0.7,
+            num_return_sequences=1
+        )
+        
+        response = model.tokenizer.decode(output[0], skip_special_tokens=True)
+        return response
+        
     except Exception as e:
         print(f"Error during AI response generation: {e}")
         return "Sorry, something went wrong while processing your request."
@@ -1346,9 +1291,9 @@ print(results)
 # ===================== GENERATION FEEDBACK LOOP (Sense of self through creation) ==========================
 
 # Define the target directory for saving files (inside your environment)
-target_directory = "C:\\Program\\Files\\Copy\\E.C.H.O\\gen"  # Adjust this path to your needs
+target_directory = os.path.join(os.getcwd(), ".workspace/gen")
 
-# Ensure the target directory exists
+# Ensure the target directory exists4
 if not os.path.exists(target_directory):
     os.makedirs(target_directory)
 
@@ -1459,7 +1404,7 @@ image_generator.safety_checker = None  # Disabling the safety checker
 image_generator = image_generator.to("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available, otherwise CPU
 
 # Target directory for saving the generated content
-target_directory = "C:\\Program\\Files\\Copy\\E.C.H.O\\gen"
+target_directory = os.path.join(os.getcwd(), ".workspace/gen")
 
 # Helper function to create unique filenames based on time
 def get_unique_filename():
@@ -1727,7 +1672,7 @@ def get_unique_filename():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Define target directory
-target_directory = "C:\\Program\\Files\\Copy\\E.C.H.O\\gen"
+target_directory = os.path.join(os.getcwd(), ".workspace/gen")
 if not os.path.exists(target_directory):
     os.makedirs(target_directory)
 
@@ -1747,8 +1692,8 @@ async def generate_image(prompt, save_path=None):
 # Function to manually run the backup
 def run_backup():
     try:
-        source_dir = "C:\\Program\\Files\\Copy\\E.C.H.O"
-        backup_dir = "C:\\Program\\Files\\Copy\\E.C.H.O-Backup"
+        source_dir = os.path.join(os.getcwd(), ".workspace/gen")
+        backup_dir = os.path.join(os.getcwd(), ".workspace/gen")
 
         # Ensure the backup directory exists
         if not os.path.exists(backup_dir):
