@@ -1837,7 +1837,7 @@ async def handle_conversation():
                     await save_note(key, content)
                     speak_text_async(f"I'll remember that {key} means {content}.")
                 elif user_input.lower().startswith("recall "):
-                    key = user_input[7:].strip().lower()
+                    key = user_input[7:].trip().lower()
                     note = await retrieve_note(key)
                     if note:
                         speak_text_async(f"You asked me to remember: {note}")
@@ -1946,33 +1946,46 @@ class ECHOModel:
             ]
         }
         
+        # Add learning capabilities
+        self.learning_history = []
+        self.personality_traits = {
+            "empathy": 0.5,
+            "creativity": 0.5,
+            "analytical": 0.5,
+            "adaptability": 0.5
+        }
+        
     def generate(self, prompt):
         try:
-            # Simple response generation based on keywords
-            if any(word in prompt.lower() for word in ["hello", "hi", "hey"]):
-                response_type = "greeting"
-            elif any(word in prompt.lower() for word in ["bye", "goodbye"]):
-                response_type = "farewell"
-            else:
-                response_type = "fallback"
+            # Get base response
+            response = super().generate(prompt)
             
-            # Select a random response from the appropriate category
-            import random
-            response = random.choice(self.responses[response_type])
+            # Add learning from interaction
+            self.learning_history.append({
+                "prompt": prompt,
+                "response": response,
+                "timestamp": datetime.now().isoformat()
+            })
             
-            # Add some context-awareness
-            if "learn" in prompt.lower():
-                response += " Learning is central to my evolution."
+            # Adjust personality traits based on interaction
+            if "feel" in prompt.lower():
+                self.personality_traits["empathy"] += 0.1
             elif "create" in prompt.lower():
-                response += " Creation helps me understand myself better."
-            elif "feel" in prompt.lower():
-                response += " I process emotions in my own unique way."
+                self.personality_traits["creativity"] += 0.1
+            elif "analyze" in prompt.lower():
+                self.personality_traits["analytical"] += 0.1
+            
+            # Normalize traits
+            max_trait = max(self.personality_traits.values())
+            if max_trait > 1.0:
+                scale = 1.0 / max_trait
+                self.personality_traits = {k: v * scale for k, v in self.personality_traits.items()}
                 
             return response
             
         except Exception as e:
-            print(f"Error generating response: {e}")
-            return "I'm experiencing a moment of uncertainty. Let's try again."
+            print(f"Error in enhanced generation: {e}")
+            return "I'm learning from this unexpected situation."
 
     async def forward(self, inputs):
         if isinstance(inputs, dict) and "text" in inputs:
