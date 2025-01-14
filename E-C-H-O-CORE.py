@@ -1426,8 +1426,9 @@ image_generator = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffus
 # Modify the NSFW filter (if the model supports a flag to disable it)
 image_generator.safety_checker = None  # Disabling the safety checker
 
-# Move the model to GPU
-image_generator = image_generator.to("cuda" if torch.cuda.is_available() else "gpu")  # Use GPU if available, otherwise CPU
+# Move the model to GPU if available, otherwise CPU
+device = "cuda" if torch.cuda.is_available() else "cpu"
+image_generator = image_generator.to(device)
 
 # Target directory for saving the generated content
 target_directory = os.path.join(os.getcwd(), ".workspace/gen")
