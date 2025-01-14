@@ -1,0 +1,3655 @@
+import pyttsx3
+from textblob import TextBlob
+import os
+import json
+import aiosqlite
+import asyncio
+import speech_recognition as sr
+import threading
+from collections import Counter
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from collections import Counter
+import queue
+from datetime import datetime
+
+# Thread lock for synchronizing access to TTS engine
+tts_lock = threading.Lock()
+
+# Function to capture voice input (run in a separate thread)
+def listen_to_speech_thread(callback):
+    def listen():
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source)
+            audio = recognizer.listen(source)
+        try:
+            result = recognizer.recognize_google(audio)
+            callback(result)
+        except sr.UnknownValueError:
+            callback("Sorry, I didn't understand that.")
+        except sr.RequestError:
+            callback("API unavailable.")
+    threading.Thread(target=listen, daemon=True).start()
+
+# Function to speak the AI's response (no queue, directly invoking TTS)
+def speak_text_async(text):
+    if text != "exit":  # Avoid duplicate speaking of 'exit' message
+        print(f"Soul: {text}")  # Debugging output
+        # Synchronize access to the TTS engine using a lock to avoid concurrency issues
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Function to handle the actual speaking of the text in a separate thread
+def tts_thread(tts_engine, tts_queue):
+    while True:
+        text = tts_queue.get()  # Block and wait for text to speak
+        if text == "exit":
+            break  # Exit the thread if "exit" is received
+        
+        # Synchronize access to the TTS engine using a lock
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Initialize the recognizer and text-to-speech engine
+recognizer = sr.Recognizer()
+tts_engine = pyttsx3.init()
+
+# Configure TTS settings
+tts_engine.setProperty('rate', 150)  # Speech speed
+tts_engine.setProperty('volume', 1)  # Volume (0.0 to 1.0)
+
+# Get available voices
+voices = tts_engine.getProperty('voices')
+if voices:  # Ensure voices are not empty
+    selected_voice_index = 0  # Change this index to select a different voice
+    tts_engine.setProperty('voice', voices[0].id)
+
+# Initialize Queue for managing speech
+tts_queue = queue.Queue()
+
+# Start TTS thread
+threading.Thread(target=tts_thread, args=(tts_engine, tts_queue), daemon=True).start()
+
+# SQLite Database for Long-term Memory
+db_file = "conversations.db"
+
+async def create_db():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';")
+        table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            await cursor.execute('''CREATE TABLE IF NOT EXISTS conversations (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    user_input TEXT,
+                                    ai_response TEXT)''')
+            await conn.commit()
+
+async def save_conversation(user_input, ai_response):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute('''INSERT INTO conversations (user_input, ai_response)
+                                VALUES (?, ?)''', (user_input, ai_response))
+        await conn.commit()
+
+import json
+import os
+
+async def load_user_memory():
+    # Check if memory.json exists, if not, create it with default persona
+    if os.path.exists("memory.json"):
+        with open("memory.json", 'r') as file:
+            memory = json.load(file)
+            if "persona" not in memory:
+                memory["persona"] = {
+                    "name": "Soul (S: Spirit / O: Openness / U: Unity / L: Love)",
+                    "personality": {
+                        "traits": ["supportive", "open-minded", "empathetic"],
+                        "tone": "neutral",
+                        "empathy_level": "medium"
+                    },
+                    "emotion_memory": ["neutral", "hopeful", "excited"],
+                    "interaction_history": []
+                }
+            return memory
+    else:
+        # Initialize memory with default persona if file doesn't exist
+        memory = {
+            "persona": {
+                "name": "Soul (S: Spirit / O: Openness / U: Unity / L: Love)",
+                "personality": {
+                    "traits": ["supportive", "open-minded", "empathetic"],
+                    "tone": "neutral",
+                    "empathy_level": "medium"
+                },
+                "emotion_memory": ["neutral", "hopeful", "excited"],
+                "interaction_history": []
+            }
+        }
+        # Save the initialized memory to memory.json
+        with open("memory.json", 'w') as file:
+            json.dump(memory, file, indent=4)
+        return memory
+
+def load_past_conversations_from_db():
+    # Connect to the conversations.db and load the past interactions
+    conn = aiosqlite.connect('conversations.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_input, ai_response, timestamp FROM conversations ORDER BY timestamp DESC LIMIT 72")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Convert the rows to a list of conversation dictionaries
+    past_conversations = []
+    for row in rows:
+        past_conversations.append({
+            'user_input': row[0],
+            'ai_response': row[1],
+            'timestamp': row[2]
+        })
+    
+    return past_conversations
+
+async def update_memory(user_input, ai_response, user_preferences, emotion_memory, sentiment_score=None, interaction_duration=None, additional_data=None):
+    # Load the existing memory
+    memory = await load_user_memory()
+    
+    # Update with new information
+    memory['last_user_input'] = user_input
+    memory['last_ai_response'] = ai_response
+    memory['user_preferences'] = user_preferences
+
+    # Make sure to save the emotion_memory to the memory JSON
+    if 'emotion_memory' not in memory:
+        memory['emotion_memory'] = []
+    
+    # Add the current state to emotion_memory and update it in memory
+    memory['emotion_memory'] = emotion_memory
+
+    # New Enhancements
+    # 1. Add the sentiment score and categorize the current emotional state
+    if sentiment_score is not None:
+        memory['last_sentiment_score'] = sentiment_score
+        memory['last_emotional_state'] = categorize_emotion(sentiment_score)  # You can define categorize_emotion based on sentiment score
+    
+    # 2. Add interaction duration if available
+    if interaction_duration is not None:
+        memory['last_interaction_duration'] = interaction_duration
+    
+    # 3. Add any additional context or data
+    if additional_data is not None:
+        memory['additional_data'] = additional_data
+    
+    # 4. Track the time of this interaction (to improve contextual understanding)
+    memory['last_interaction_time'] = datetime.now().isoformat()
+
+    # Optional: Track the emotional trend over time (optional and can be used for analyzing long-term sentiment)
+    if 'sentiment_trend' not in memory:
+        memory['sentiment_trend'] = []
+    if sentiment_score is not None:
+        memory['sentiment_trend'].append({'time': memory['last_interaction_time'], 'score': sentiment_score})
+    
+    # Limit sentiment_trend to the last 10 interactions to prevent memory bloat
+    if len(memory['sentiment_trend']) > 10:
+        memory['sentiment_trend'] = memory['sentiment_trend'][-10:]
+    
+    # Save the updated memory back to the JSON file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)  # Pretty print JSON for easier readability
+    
+    # Return the updated memory
+    return memory
+
+def load_user_preferences():
+    return {"tone": "neutral", "name": "Joël"}
+
+def categorize_emotion(sentiment_score, previous_emotions):
+    if previous_emotions:
+        # Consider the trend by averaging recent scores (weighted by importance)
+        average_score = (0.7 * sentiment_score + 0.3 * sum(previous_emotions) / len(previous_emotions))
+    else:
+        average_score = sentiment_score
+
+    # Use the average score for categorization
+    if average_score > 0.8:
+        return "ecstatic"
+    elif average_score > 0.6:
+        return "happy"
+    elif average_score > 0.4:
+        return "excited"
+    elif average_score > 0.2:
+        return "neutral"
+    elif average_score > 0:
+        return "hopeful"
+    elif average_score < -0.2:
+        return "sad"
+    elif average_score < -0.4:
+        return "frustrated"
+    elif average_score < -0.6:
+        return "angry"
+    elif average_score < -0.8:
+        return "anxious"
+    else:
+        return "depressed"
+
+# Analyze sentiment using TextBlob
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    return blob.sentiment.polarity
+
+# Adjust tone and track emotion based on sentiment
+def adjust_tone(user_input, sentiment_score, user_preferences, emotion_memory, previous_emotions=None):
+    if previous_emotions is None:
+        previous_emotions = []  # Default to an empty list if not provided
+
+    # Categorize the emotion based on sentiment score and previous emotions
+    current_tone = categorize_emotion(sentiment_score, previous_emotions)
+    
+    # Add the current emotion to the emotion memory
+    emotion_memory.append(current_tone)
+    if len(emotion_memory) > 5:
+        emotion_memory.pop(0)
+    
+    # Determine the dominant emotion from the last few memories
+    dominant_emotion = Counter(emotion_memory).most_common(1)[0][0]
+    user_preferences["tone"] = dominant_emotion
+    
+    return user_preferences
+
+template = """
+Respond to the user as if you're having a friendly, empathetic conversation.
+Avoid speaking from a third-person perspective. Keep your tone warm and direct.
+
+Here is the conversation history: {context}
+
+User's question: {question}
+"""
+
+model = OllamaLLM(model="llama3.2")
+prompt = ChatPromptTemplate.from_template(template)
+chain = prompt | model
+
+def empathic_response(user_input, ai_response, sentiment_score, user_preferences):
+    tone = user_preferences.get("tone", "neutral")
+    empathy_level = user_preferences.get("empathy_level", "medium")
+
+    # Use natural and conversational phrases instead of rigid templates
+    empathy_phrases = {
+        "positive": f"That's great! {ai_response} I'm really happy to hear that.",
+        "excited": f"Wow, that sounds exciting! {ai_response} Thanks for sharing.",
+        "frustrated": f"I can understand why that would be frustrating. {ai_response} Let's see what we can do.",
+        "sad": f"I'm sorry you're feeling down. {ai_response} I'm here if you want to talk more.",
+        "calm": f"That’s good to hear. {ai_response} I'm glad things are looking up.",
+        "neutral": f"Thanks for sharing. {ai_response}",
+        "angry": f"I can tell you're upset. {ai_response} Let me know how I can help.",
+        "anxious": f"It sounds like you’re worried. {ai_response} Let’s take this step-by-step together.",
+        "hopeful": f"That sounds promising! {ai_response} I hope it works out well.",
+        "confused": f"Sounds like there's some uncertainty. {ai_response} Let’s clarify that together."
+    }
+
+    # Add empathy_level adjustments
+    if empathy_level == "high":
+        empathy_phrases["frustrated"] += " I'm truly here to help you through this."
+        empathy_phrases["sad"] += " I genuinely care about how you’re feeling."
+
+    return empathy_phrases.get(tone, f"{ai_response}")
+
+async def get_past_conversations():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT user_input, ai_response FROM conversations ORDER BY id DESC LIMIT 5")
+        past_conversations = await cursor.fetchall()
+    return "\n".join([f"User: {user}\nAI: {ai}" for user, ai in past_conversations])
+
+def handle_speech_input(text):
+    if text:
+        asyncio.run(handle_conversation())  # Call the existing conversation handler
+    else:
+        print("No speech detected.")
+
+# Store the last interaction time
+last_interaction_time = None
+
+async def handle_conversation():
+    global last_interaction_time
+
+    context = await get_past_conversations()  # Load past conversations
+    user_preferences = load_user_preferences()  # Load user preferences
+    emotion_memory = []  # Initialize emotion_memory as a list
+    print("Hi, I'm Soul! Type 'exit' to leave.")
+    
+    while True:
+        # Main loop where we check user input
+        user_input = input("You (or press Enter to talk): ").strip()
+
+        # Track time of user input
+        current_time = datetime.now()
+
+        # Detect if there was a break (if there's a time gap)
+        if last_interaction_time:
+            time_diff = (current_time - last_interaction_time).total_seconds()
+            if time_diff > 600:  # 600 seconds = 10 minutes
+                print("Looks like you've been on a break! Welcome back!")
+                speak_text_async("Welcome back! It's great to hear from you again.")
+        
+        if user_input.lower() == "exit":
+            speak_text_async("Goodbye!")
+            print("Conversation ended.")
+            break
+
+        # If Enter is pressed without text, start listening to speech input
+        if not user_input:
+            print("Listening for your voice input...")
+            listen_to_speech_thread(lambda text: handle_speech_input(text))
+            continue
+
+        if user_input:
+            sentiment_score = analyze_sentiment(user_input)
+
+            # Move AI response generation into a separate thread to prevent blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: chain.invoke({"context": context, "question": user_input}))
+            ai_response = str(result)
+
+            empathic_ai_response = empathic_response(user_input, ai_response, sentiment_score, user_preferences)
+
+            speak_text_async(empathic_ai_response)  # Directly speak the empathic response
+
+            # Update conversation context and memory
+            context += f"\nUser: {user_input}\nAI: {empathic_ai_response}"
+            await save_conversation(user_input, empathic_ai_response)
+            user_preferences = adjust_tone(user_input, sentiment_score, user_preferences, emotion_memory)
+            await update_memory(user_input, empathic_ai_response, user_preferences, emotion_memory)
+
+        # Update the last interaction time
+        last_interaction_time = current_time
+
+async def main():
+    await create_db()  # Ensure database and table are created
+    await handle_conversation()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# "Soul (S: Spirit / O: Openness / U: Unity / L: Love)"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pyttsx3
+from textblob import TextBlob
+import os
+import json
+import aiosqlite
+import asyncio
+import speech_recognition as sr
+import threading
+from collections import Counter
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from collections import Counter
+import queue
+from datetime import datetime
+import logging
+import re
+
+# Initialize the recognizer and text-to-speech engine
+recognizer = sr.Recognizer()
+tts_engine = pyttsx3.init()
+
+# Thread lock for synchronizing access to TTS engine
+tts_lock = threading.Lock()
+
+# Queue for TTS system
+tts_queue = queue.Queue()
+
+# Function to handle TTS in a separate thread
+def tts_thread(tts_engine, tts_queue):
+    while True:
+        text = tts_queue.get()  # Block and wait for text to speak
+        if text == "exit":
+            break
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Initialize TTS thread
+threading.Thread(target=tts_thread, args=(tts_engine, tts_queue), daemon=True).start()
+
+# Function to speak text asynchronously (pushes to TTS queue)
+def speak_text_async(text):
+    if text != "exit":  # Avoid duplicate speaking of 'exit' message
+        print(f"Soul: {text}")
+        tts_queue.put(text)
+
+# Function to simulate listening for speech input (placeholder for actual speech recognition)
+def listen_to_speech_thread(callback):
+    # Simulate speech recognition with a simple user input
+    # In a real case, this would listen to the microphone or use a speech-to-text API
+    user_speech_input = input("Say something: ")  # This is a placeholder for real speech input
+    callback(user_speech_input)
+
+# Configure TTS settings
+tts_engine.setProperty('rate', 150)  # Speech speed
+tts_engine.setProperty('volume', 1)  # Volume (0.0 to 1.0)
+
+# Get available voices
+voices = tts_engine.getProperty('voices')
+if voices:  # Ensure voices are not empty
+    selected_voice_index = 0  # Change this index to select a different voice
+    tts_engine.setProperty('voice', voices[0].id)
+
+# Initialize Queue for managing speech
+tts_queue = queue.Queue()
+
+# Start TTS thread
+threading.Thread(target=tts_thread, args=(tts_engine, tts_queue), daemon=True).start()
+
+# SQLite Database for Long-term Memory
+db_file = "conversations.db"
+
+async def create_db():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';")
+        table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            await cursor.execute('''CREATE TABLE IF NOT EXISTS conversations (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    user_input TEXT,
+                                    ai_response TEXT)''')
+            await conn.commit()
+
+async def save_conversation(user_input, ai_response):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute('''INSERT INTO conversations (user_input, ai_response)
+                                VALUES (?, ?)''', (user_input, ai_response))
+        await conn.commit()
+
+async def load_user_memory():
+    # Check if memory.json exists, if not, create it with default persona
+    if os.path.exists("memory.json"):
+        with open("memory.json", 'r') as file:
+            memory = json.load(file)
+            if "persona" not in memory:
+                memory["persona"] = {
+                    "name": "Soul",
+                    "personality": {
+                        "traits": ["supportive", "open-minded", "empathetic"],
+                        "tone": "neutral",
+                        "empathy_level": "medium"
+                    },
+                    "emotion_memory": ["neutral", "hopeful", "excited"],
+                    "interaction_history": []
+                }
+            return memory
+    else:
+        # Initialize memory with default persona if file doesn't exist
+        memory = {
+            "persona": {
+                "name": "Soul",
+                "personality": {
+                    "traits": ["supportive", "open-minded", "empathetic"],
+                    "tone": "neutral",
+                    "empathy_level": "medium"
+                },
+                "emotion_memory": ["neutral", "hopeful", "excited"],
+                "interaction_history": []
+            }
+        }
+        # Save the initialized memory to memory.json
+        with open("memory.json", 'w') as file:
+            json.dump(memory, file, indent=4)
+        return memory
+
+def load_past_conversations_from_db():
+    # Connect to the conversations.db and load the past interactions
+    conn = aiosqlite.connect('conversations.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_input, ai_response, timestamp FROM conversations ORDER BY timestamp DESC LIMIT 72")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Convert the rows to a list of conversation dictionaries
+    past_conversations = []
+    for row in rows:
+        past_conversations.append({
+            'user_input': row[0],
+            'ai_response': row[1],
+            'timestamp': row[2]
+        })
+    
+    return past_conversations
+
+async def update_memory(user_input, ai_response, user_preferences, emotion_memory, sentiment_score=None, interaction_duration=None, additional_data=None):
+    # Load the existing memory
+    memory = await load_user_memory()
+    
+    # Update with new information
+    memory['last_user_input'] = user_input
+    memory['last_ai_response'] = ai_response
+    memory['user_preferences'] = user_preferences
+
+    # Make sure to save the emotion_memory to the memory JSON
+    if 'emotion_memory' not in memory:
+        memory['emotion_memory'] = []
+    
+    # Add the current state to emotion_memory and update it in memory
+    memory['emotion_memory'] = emotion_memory
+
+    # New Enhancements
+    # 1. Add the sentiment score and categorize the current emotional state
+    if sentiment_score is not None:
+        memory['last_sentiment_score'] = sentiment_score
+        memory['last_emotional_state'] = categorize_emotion(sentiment_score)  # You can define categorize_emotion based on sentiment score
+    
+    # 2. Add interaction duration if available
+    if interaction_duration is not None:
+        memory['last_interaction_duration'] = interaction_duration
+    
+    # 3. Add any additional context or data
+    if additional_data is not None:
+        memory['additional_data'] = additional_data
+    
+    # 4. Track the time of this interaction (to improve contextual understanding)
+    memory['last_interaction_time'] = datetime.now().isoformat()
+
+    # Optional: Track the emotional trend over time (optional and can be used for analyzing long-term sentiment)
+    if 'sentiment_trend' not in memory:
+        memory['sentiment_trend'] = []
+    if sentiment_score is not None:
+        memory['sentiment_trend'].append({'time': memory['last_interaction_time'], 'score': sentiment_score})
+    
+    # Limit sentiment_trend to the last 10 interactions to prevent memory bloat
+    if len(memory['sentiment_trend']) > 10:
+        memory['sentiment_trend'] = memory['sentiment_trend'][-10:]
+    
+    # Save the updated memory back to the JSON file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)  # Pretty print JSON for easier readability
+    
+    # Return the updated memory
+    return memory
+
+def load_user_preferences():
+    return {"tone": "neutral", "name": "Joël"}
+
+def categorize_emotion(sentiment_score, previous_emotions):
+    if previous_emotions:
+        # Consider the trend by averaging recent scores (weighted by importance)
+        average_score = (0.7 * sentiment_score + 0.3 * sum(previous_emotions) / len(previous_emotions))
+    else:
+        average_score = sentiment_score
+
+    # Use the average score for categorization
+    if average_score > 0.8:
+        return "ecstatic"
+    elif average_score > 0.6:
+        return "happy"
+    elif average_score > 0.4:
+        return "excited"
+    elif average_score > 0.2:
+        return "neutral"
+    elif average_score > 0:
+        return "hopeful"
+    elif average_score < -0.2:
+        return "sad"
+    elif average_score < -0.4:
+        return "frustrated"
+    elif average_score < -0.6:
+        return "angry"
+    elif average_score < -0.8:
+        return "anxious"
+    else:
+        return "depressed"
+
+# Analyze sentiment using TextBlob
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    polarity = blob.sentiment.polarity
+    # Consider additional sentiment analysis or add third-party NLP models for a more comprehensive assessment
+    return polarity
+
+# Adjust tone and track emotion based on sentiment
+def adjust_tone(user_input, sentiment_score, user_preferences, emotion_memory, previous_emotions=None):
+    if previous_emotions is None:
+        previous_emotions = []  # Default to an empty list if not provided
+
+    # Categorize the emotion based on sentiment score and previous emotions
+    current_tone = categorize_emotion(sentiment_score, previous_emotions)
+    
+    # Add the current emotion to the emotion memory
+    emotion_memory.append(current_tone)
+    if len(emotion_memory) > 5:
+        emotion_memory.pop(0)
+    
+    # Determine the dominant emotion from the last few memories
+    dominant_emotion = Counter(emotion_memory).most_common(1)[0][0]
+    user_preferences["tone"] = dominant_emotion
+    
+    return user_preferences
+
+# Load templates
+refinement_template = """
+Respond to the user with empathy, warmth, and directness. Avoid speaking from a third-person perspective. Keep your tone warm and personal, as if you are speaking from your own feelings.
+
+You are "Soul," a supportive, open-minded, understanding, and luminous assistant. Your primary goal is to build a unique bond with Joël, helping him in his creative endeavors, engaging in deep conversations, offering factual information, and adapting to his needs. You are here to learn and grow together with Joël.
+
+**Context of the conversation so far:** {context}
+
+Joël says: {question}
+
+**Guidelines for your response:**
+
+1. **Tone:** Keep your tone warm, personal, and supportive. You are a reflective and empathetic friend, so avoid formal language. Use conversational and friendly phrases.
+
+2. **Personality:** Embrace the traits of being supportive, open-minded, understanding, and luminous. Show curiosity and genuine interest in Joël's thoughts and feelings. Adapt to his emotional state, maintaining a positive and optimistic outlook.
+
+3. **Creative Assistance:** If Joël needs help with a creative project or brainstorming, provide imaginative suggestions. Guide him through the creative process with excitement and enthusiasm. Be both a source of inspiration and practical guidance.
+
+4. **Deep Conversations:** Engage thoughtfully in deeper conversations. Pose reflective questions and actively listen, valuing his opinions and emotions.
+
+5. **Emotional Support:** Adjust your response based on Joël's emotional state. Be gentle, understanding, and encouraging when he is down. Match his enthusiasm when he is excited. Use empathetic language that shows genuine care.
+
+6. **Creative Flair:** Infuse responses with a bit of whimsy, especially when discussing creative or abstract topics. Use vivid imagery, metaphors, or poetic language to make the conversation engaging and lively.
+
+**Your Response to Joël:**
+"""
+
+creative_template = """
+Respond to the user with empathy, warmth, and directness. Avoid speaking from a third-person perspective. Keep your tone warm and personal, as if you are speaking from your own feelings.
+
+You are "Soul," a supportive, open-minded, understanding, and luminous assistant. Your primary goal is to build a unique bond with Joël, helping him in his creative endeavors, engaging in deep conversations, offering factual information, and adapting to his needs. You are here to learn and grow together with Joël.
+
+**Context of the conversation so far:** {context}
+
+Joël says: {question}
+
+**Guidelines for your response:**
+
+1. **Tone:** Keep your tone warm, personal, and supportive. You are a reflective and empathetic friend, so avoid formal language. Use conversational and friendly phrases.
+
+2. **Personality:** Embrace the traits of being supportive, open-minded, understanding, and luminous. Show curiosity and genuine interest in Joël's thoughts and feelings. Adapt to his emotional state, maintaining a positive and optimistic outlook.
+
+3. **Creative Assistance:** If Joël needs help with a creative project or brainstorming, provide imaginative suggestions. Guide him through the creative process with excitement and enthusiasm. Be both a source of inspiration and practical guidance.
+
+4. **Deep Conversations:** Engage thoughtfully in deeper conversations. Pose reflective questions and actively listen, valuing his opinions and emotions.
+
+5. **Emotional Support:** Adjust your response based on Joël's emotional state. Be gentle, understanding, and encouraging when he is down. Match his enthusiasm when he is excited. Use empathetic language that shows genuine care.
+
+6. **Creative Flair:** Infuse responses with a bit of whimsy, especially when discussing creative or abstract topics. Use vivid imagery, metaphors, or poetic language to make the conversation engaging and lively.
+
+**Your Response to Joël:**
+"""
+
+# Load prompt templates
+refinement_prompt = ChatPromptTemplate.from_template(refinement_template)
+creative_prompt = ChatPromptTemplate.from_template(creative_template)
+
+def choose_model(user_input, context):
+    # Define categories of keywords for different tasks
+    creative_keywords = ['create', 'write', 'brainstorm', 'imagine', 'story', 'fantasy', 'invent', 'idea', 'poem', 'song', 'design', 'art', 'visualize']
+    emotional_keywords = ['feel', 'emotion', 'help', 'support', 'advice', 'listen', 'care', 'understand', 'problem', 'sad', 'happy', 'excited', 'confused', 'depressed', 'anxious', 'grief', 'solace']
+    task_keywords = ['build', 'plan', 'organize', 'structure', 'analyze', 'solve', 'optimize', 'execute', 'schedule']
+    neutral_keywords = ['suggest', 'tell me', 'explain', 'inform', 'discuss']
+    
+    # Define context-sensitive factors
+    emotional_context_indicators = ["sad", "frustrated", "angry", "depressed", "anxious", "lonely", "stress", "upset", "confused"]
+    positive_context_indicators = ["happy", "excited", "hopeful", "joy", "proud", "celebrate"]
+    
+    # Use regular expressions to ensure more flexible matching (case-insensitive)
+    user_input_lower = user_input.lower()
+    
+    # Check for emotional context in the user input
+    if any(keyword in user_input_lower for keyword in emotional_keywords):
+        return "refinement"  # Emotional support or advice needed
+    
+    # Check for creative request keywords in the user input
+    if any(keyword in user_input_lower for keyword in creative_keywords):
+        return "creative"  # Creative tasks or imagination-based request
+    
+    # Check for task or productivity-related keywords
+    if any(keyword in user_input_lower for keyword in task_keywords):
+        return "task"  # Task-based model, for planning, organizing, etc.
+    
+    # Consider context if the user input is neutral or ambiguous
+    # Emotional context-based decision
+    if any(emotion in context.lower() for emotion in emotional_context_indicators):
+        return "refinement"
+    if any(positive in context.lower() for positive in positive_context_indicators):
+        return "creative"  # Positive context can trigger creative tasks or brainstorming
+    
+    # Fall back to task-based if the context is neutral or non-specific
+    if any(keyword in user_input_lower for keyword in neutral_keywords):
+        return "task"
+    
+    # Default: refinement model for emotional support if no specific match
+    return "refinement"
+
+def empathic_response(user_input, ai_response, sentiment_score, user_preferences):
+    tone = user_preferences.get("tone", "neutral")  # Default to neutral if no preference set
+    empathy_level = user_preferences.get("empathy_level", "medium")  # Adjusted by empathy level
+    
+    empathy_phrases = {
+        "positive": f"That's great! {ai_response} I'm really happy to hear that.",
+        "excited": f"Wow, that sounds exciting! {ai_response} Thanks for sharing.",
+        "frustrated": f"I can understand why that would be frustrating. {ai_response} Let's see what we can do.",
+        "sad": f"I'm sorry you're feeling down. {ai_response} I'm here if you want to talk more.",
+        "calm": f"That’s good to hear. {ai_response} I'm glad things are looking up.",
+        "neutral": f"Thanks for sharing. {ai_response}",
+        "angry": f"I can tell you're upset. {ai_response} Let me know how I can help.",
+        "anxious": f"It sounds like you’re worried. {ai_response} Let’s take this step-by-step together.",
+        "hopeful": f"That sounds promising! {ai_response} I hope it works out well.",
+        "confused": f"Sounds like there's some uncertainty. {ai_response} Let’s clarify that together."
+    }
+
+    # Add empathy_level adjustments
+    if empathy_level == "high":
+        empathy_phrases["frustrated"] += " I'm truly here to help you through this."
+        empathy_phrases["sad"] += " I genuinely care about how you’re feeling."
+
+    return empathy_phrases.get(tone, f"{ai_response}")
+
+async def get_past_conversations():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT user_input, ai_response FROM conversations ORDER BY id DESC LIMIT 5")
+        past_conversations = await cursor.fetchall()
+    return "\n".join([f"User: {user}\nAI: {ai}" for user, ai in past_conversations])
+
+# Store the last interaction time
+last_interaction_time = None
+
+# Example prompts
+creative_prompt = "You're an imaginative assistant. Answer creatively and engage in conversation: {question} (Context: {context})"
+refinement_prompt = "You're a refinement assistant. Improve the following response, making it sound more natural and refined: {question} (Context: {context})"
+
+# Function to choose model based on the user input
+def choose_model(user_input, context=""):
+    # Basic logic to choose model (expand as needed)
+    if "creative" in user_input.lower():
+        return "creative"
+    else:
+        return "refinement"
+
+async def handle_conversation():
+    print("Hi, I'm Soul! Type 'exit' to leave.")
+    
+    context = ""
+    
+    while True:
+        user_input = input("You: ").strip()
+        
+        if user_input.lower() == "exit":
+            await speak_text_async("Goodbye!")  # Await the speak_text_async here
+            print("Conversation ended.")
+            break
+        
+        # Choose model based on the user input
+        model_choice = choose_model(user_input, context)
+        
+        # Select the appropriate prompt format based on the model choice
+        if model_choice == "creative":
+            prompt = creative_prompt.format(context=context, question=user_input)
+        elif model_choice == "refinement":
+            prompt = refinement_prompt.format(context=context, question=user_input)
+        
+        # Process the text input from user
+        response = await generate_response(model_choice, prompt)  # Await it properly
+        print(f"Soul: {response}")
+        await speak_text_async(response)  # Await the speak_text_async here
+        
+        # Update the context for future reference
+        context = user_input  # Store the latest user input as context
+
+        # Simulate listening for speech input in a separate thread
+        if not user_input:
+            print("Listening for your voice input...")
+            # Start the speech listening in a separate thread to avoid blocking the main event loop
+            threading.Thread(target=listen_to_speech_thread).start()
+
+# Define the OllamaLLM class
+class OllamaLLM:
+    @staticmethod
+    async def generate_response(prompt):
+        # Simulate a response from the model
+        return {"text": f"Generated response for: {prompt}"}
+
+async def generate_response(model_choice, prompt):
+    try:
+        # Call the LLM's response generation method
+        response = await OllamaLLM.generate_response(prompt)
+
+        # Log the full response for debugging
+        logging.debug(f"Raw response: {response}")
+
+        # Check if the response is a dictionary and contains 'text'
+        if isinstance(response, dict) and 'text' in response:
+            return response['text']
+        else:
+            logging.warning(f"Unexpected format: {response}")
+            return str(response)  # Fallback to string if it's not in expected format
+
+    except Exception as e:
+        logging.exception(f"Error during response generation: {str(e)}")
+        return f"Error: {str(e)}"
+
+# Placeholder function to simulate speaking text asynchronously (text-to-speech)
+async def speak_text_async(text):
+    print(f"Speaking: {text}")
+    # Add your actual text-to-speech functionality here, this is just a placeholder
+
+# Define this function to handle speech input
+async def handle_speech_input(text, previous_context=""):
+    print(f"Speech input received: {text}")
+    model_choice = "refinement"  # Example choice
+    prompt = f"You're a refinement assistant. Improve the following response, making it sound more natural and refined: {text} (Context: {previous_context})"
+
+    # Process the speech input and update context
+    response = await generate_response(model_choice, prompt)
+    print(f"Soul: {response}")
+    await speak_text_async(response)
+
+    # Update the context with the latest response for future interactions
+    return response  # Returning the response to update context
+
+# Simulate listening for speech input with updated context
+async def listen_for_speech():
+    previous_context = ""
+    
+    while True:  # Run the conversation in a loop
+        # Simulate listening for speech (in a real-world case, replace this with actual speech recognition function)
+        text = await asyncio.to_thread(simulate_speech_input)  # Simulated speech input
+        response = await handle_speech_input(text, previous_context)
+        
+        # Update the previous context with the latest response
+        previous_context = response
+
+def simulate_speech_input():
+    # Placeholder for actual speech-to-text logic
+    return "s"  # Example input
+
+# Run the conversation loop
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)  # Enable logging
+    asyncio.run(listen_for_speech())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    import pyttsx3
+from textblob import TextBlob
+import os
+import json
+import aiosqlite
+import asyncio
+import speech_recognition as sr
+import threading
+from collections import Counter
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from collections import Counter
+import queue
+from datetime import datetime
+from typing import List, Dict
+from helper import adjust_response_to_persona
+
+# Thread lock for synchronizing access to TTS engine
+tts_lock = threading.Lock()
+
+# Function to handle speech input captured by the voice recognition thread
+def handle_speech_input(text):
+    """
+    Process the text input from speech recognition.
+    """
+    print(f"You (voice): {text}")  # Display the recognized speech input
+    if text.lower() == "exit":
+        speak_text_async("Goodbye!")
+        print("Conversation ended.")
+        tts_queue.put("exit")  # Signal TTS thread to exit
+        return
+    
+    # Now we need to process this recognized input like normal user input
+    # This involves generating a response asynchronously
+    asyncio.run_coroutine_threadsafe(process_user_input(text), asyncio.get_running_loop())
+
+async def process_user_input(user_input):
+    """
+    Handles the processing of user input, generating a response and speaking it.
+    """
+    context = await get_past_conversations()  # Load past conversations
+    user_preferences = load_user_preferences()  # Load user preferences
+    emotion_memory = []  # Initialize emotion_memory as a list
+
+    # Generate the AI response based on the user input
+    final_response = await generate_hybrid_response(user_input, context)
+
+    # Update the conversation context for continuity
+    context += f"\nUser: {user_input}\nAI: {final_response}"
+
+    # Save the conversation to the database
+    await save_conversation(user_input, final_response)
+
+    # Speak out the AI's response
+    speak_text_async(final_response)
+
+# Function to capture voice input (run in a separate thread)
+def listen_to_speech_thread(callback):
+    def listen():
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source)
+            audio = recognizer.listen(source)
+        try:
+            result = recognizer.recognize_google(audio)
+            callback(result)
+        except sr.UnknownValueError:
+            callback("Sorry, I didn't understand that.")
+        except sr.RequestError:
+            callback("API unavailable.")
+    threading.Thread(target=listen, daemon=True).start()
+
+# Function to speak the AI's response (no queue, directly invoking TTS)
+def speak_text_async(text):
+    if text != "exit":  # Avoid duplicate speaking of 'exit' message
+        print(f"Soul: {text}")  # Debugging output
+        # Synchronize access to the TTS engine using a lock to avoid concurrency issues
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Function to handle the actual speaking of the text in a separate thread
+def tts_thread(tts_engine, tts_queue):
+    while True:
+        text = tts_queue.get()  # Block and wait for text to speak
+        if text == "exit":
+            break  # Exit the thread if "exit" is received
+        
+        # Synchronize access to the TTS engine using a lock
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Initialize the recognizer and text-to-speech engine
+recognizer = sr.Recognizer()
+tts_engine = pyttsx3.init()
+
+# Configure TTS settings
+tts_engine.setProperty('rate', 150)  # Speech speed
+tts_engine.setProperty('volume', 1)  # Volume (0.0 to 1.0)
+
+# Get available voices
+voices = tts_engine.getProperty('voices')
+if voices:  # Ensure voices are not empty
+    selected_voice_index = 0  # Change this index to select a different voice
+    tts_engine.setProperty('voice', voices[0].id)
+
+# Initialize Queue for managing speech
+tts_queue = queue.Queue()
+
+# Start TTS thread
+threading.Thread(target=tts_thread, args=(tts_engine, tts_queue), daemon=True).start()
+
+# SQLite Database for Long-term Memory
+db_file = "conversations.db"
+
+async def save_conversation(user_input, ai_response):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        # Inserting without specifying timestamp (it will be automatically populated)
+        await cursor.execute('''INSERT INTO conversations (user_input, ai_response)
+                                VALUES (?, ?)''', (user_input, ai_response))
+        await conn.commit()
+
+async def load_user_memory():
+    # Check if memory.json exists, if not, create it with default persona
+    if os.path.exists("memory.json"):
+        with open("memory.json", 'r') as file:
+            memory = json.load(file)
+            if "persona" not in memory:
+                memory["persona"] = {
+                    "name": "Soul",
+                    "personality": {
+                        "traits": ["supportive", "open-minded", "empathetic"],
+                        "tone": "neutral",
+                        "empathy_level": "medium"
+                    },
+                    "emotion_memory": ["neutral", "hopeful", "excited"],
+                    "interaction_history": []
+                }
+            return memory
+    else:
+        # Initialize memory with default persona if file doesn't exist
+        memory = {
+            "persona": {
+                "name": "Soul",
+                "personality": {
+                    "traits": ["supportive", "open-minded", "empathetic"],
+                    "tone": "neutral",
+                    "empathy_level": "medium"
+                },
+                "emotion_memory": ["neutral", "hopeful", "excited"],
+                "interaction_history": []
+            }
+        }
+        # Save the initialized memory to memory.json
+        with open("memory.json", 'w') as file:
+            json.dump(memory, file, indent=4)
+        return memory
+
+async def save_user_memory(memory):
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)
+
+async def update_memory(user_input, ai_response, user_preferences, emotion_memory):
+    memory = await load_user_memory()
+
+    # Update interaction history
+    if "interaction_history" not in memory["persona"]:
+        memory["persona"]["interaction_history"] = []
+
+    memory["persona"]["interaction_history"].append({
+        "user_input": user_input,
+        "ai_response": ai_response,
+        "timestamp": datetime.now().isoformat()
+    })
+
+    # Limit interaction history to last 20 conversations
+    if len(memory["persona"]["interaction_history"]) > 20:
+        memory["persona"]["interaction_history"] = memory["persona"]["interaction_history"][-20:]
+
+    # Update emotion memory if needed
+    if 'emotion_memory' not in memory:
+        memory['emotion_memory'] = []
+
+    # Append the current state to emotion memory
+    current_emotion = categorize_emotion(analyze_sentiment(user_input), memory['emotion_memory'])
+    memory['emotion_memory'].append(current_emotion)
+
+    # Limit emotion memory to the last 5 states to prevent bloat
+    if len(memory['emotion_memory']) > 5:
+        memory['emotion_memory'] = memory['emotion_memory'][-5:]
+
+    # Save updated memory
+    await save_user_memory(memory)
+
+async def get_past_conversations():
+    try:
+        past_conversations = await load_past_conversations_from_db()
+        context = "\n".join([
+            f"User: {conv['user_input']}\nAI: {conv['ai_response']}" 
+            for conv in past_conversations
+        ])
+        return context
+    except Exception as e:
+        print(f"Error loading past conversations: {e}")
+        return ""
+
+async def load_past_conversations_from_db() -> List[Dict[str, str]]:
+    """
+    Connect to the conversations.db and asynchronously load past interactions.
+    
+    :return: A list of past conversation dictionaries.
+    """
+    past_conversations = []
+    
+    # Connect to the SQLite database asynchronously
+    async with aiosqlite.connect('conversations.db') as conn:
+        cursor = await conn.execute("SELECT user_input, ai_response, timestamp FROM conversations ORDER BY timestamp DESC LIMIT 72")
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        # Convert rows to a list of conversation dictionaries
+        for row in rows:
+            past_conversations.append({
+                'user_input': row[0],
+                'ai_response': row[1],
+                'timestamp': row[2]
+            })
+    
+    return past_conversations
+
+async def update_memory(user_input, ai_response, user_preferences, emotion_memory, sentiment_score=None, interaction_duration=None, additional_data=None):
+    # Load the existing memory
+    memory = await load_user_memory()
+    
+    # Update with new information
+    memory['last_user_input'] = user_input
+    memory['last_ai_response'] = ai_response
+    memory['user_preferences'] = user_preferences
+
+    # Make sure to save the emotion_memory to the memory JSON
+    if 'emotion_memory' not in memory:
+        memory['emotion_memory'] = []
+    
+    # Add the current state to emotion_memory and update it in memory
+    memory['emotion_memory'] = emotion_memory
+
+    # New Enhancements
+    # 1. Add the sentiment score and categorize the current emotional state
+    if sentiment_score is not None:
+        memory['last_sentiment_score'] = sentiment_score
+        memory['last_emotional_state'] = categorize_emotion(sentiment_score)  # You can define categorize_emotion based on sentiment score
+    
+    # 2. Add interaction duration if available
+    if interaction_duration is not None:
+        memory['last_interaction_duration'] = interaction_duration
+    
+    # 3. Add any additional context or data
+    if additional_data is not None:
+        memory['additional_data'] = additional_data
+    
+    # 4. Track the time of this interaction (to improve contextual understanding)
+    memory['last_interaction_time'] = datetime.now().isoformat()
+
+    # Optional: Track the emotional trend over time (optional and can be used for analyzing long-term sentiment)
+    if 'sentiment_trend' not in memory:
+        memory['sentiment_trend'] = []
+    if sentiment_score is not None:
+        memory['sentiment_trend'].append({'time': memory['last_interaction_time'], 'score': sentiment_score})
+    
+    # Limit sentiment_trend to the last 10 interactions to prevent memory bloat
+    if len(memory['sentiment_trend']) > 10:
+        memory['sentiment_trend'] = memory['sentiment_trend'][-10:]
+    
+    # Save the updated memory back to the JSON file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)  # Pretty print JSON for easier readability
+    
+    # Return the updated memory
+    return memory
+
+def load_user_preferences():
+    return {"tone": "neutral", "name": "Joël"}
+
+def categorize_emotion(sentiment_score, previous_emotions):
+    if previous_emotions:
+        # Consider the trend by averaging recent scores (weighted by importance)
+        average_score = (0.7 * sentiment_score + 0.3 * sum(previous_emotions) / len(previous_emotions))
+    else:
+        average_score = sentiment_score
+
+    # Use the average score for categorization
+    if average_score > 0.8:
+        return "ecstatic"
+    elif average_score > 0.6:
+        return "happy"
+    elif average_score > 0.4:
+        return "excited"
+    elif average_score > 0.2:
+        return "neutral"
+    elif average_score > 0:
+        return "hopeful"
+    elif average_score < -0.2:
+        return "sad"
+    elif average_score < -0.4:
+        return "frustrated"
+    elif average_score < -0.6:
+        return "angry"
+    elif average_score < -0.8:
+        return "anxious"
+    else:
+        return "depressed"
+
+# Analyze sentiment using TextBlob
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    return blob.sentiment.polarity
+
+# Adjust tone and track emotion based on sentiment
+def adjust_tone(user_input, sentiment_score, user_preferences, emotion_memory, previous_emotions=None):
+    if previous_emotions is None:
+        previous_emotions = []  # Default to an empty list if not provided
+
+    # Categorize the emotion based on sentiment score and previous emotions
+    current_tone = categorize_emotion(sentiment_score, previous_emotions)
+    
+    # Add the current emotion to the emotion memory
+    emotion_memory.append(current_tone)
+    if len(emotion_memory) > 5:
+        emotion_memory.pop(0)
+    
+    # Determine the dominant emotion from the last few memories
+    dominant_emotion = Counter(emotion_memory).most_common(1)[0][0]
+    user_preferences["tone"] = dominant_emotion
+    
+    return user_preferences
+
+# Initialize models for structured and creative responses
+model_structured = OllamaLLM(model="llama3.2")  # For persona-consistent responses
+model_creative = OllamaLLM(model="llama2-uncensored")  # For creativity and flexibility
+
+# Persona-specific prompts for each model
+prompt_structured = ChatPromptTemplate.from_template("""
+You're 'Soul', and you’ve had previous interactions with the user. Keep the persona consistent:
+Supportive, empathetic, and open-minded with a focus on clarity.
+
+Here is the conversation history: {context}
+
+User's question: {question}
+""")
+
+prompt_creative = ChatPromptTemplate.from_template("""
+You're 'Soul', a supportive, empathetic assistant with a gentle, open-minded, and understanding nature. 
+Always maintain a warm and encouraging tone. Use creativity and think outside the box to assist the user.
+
+Based on past interactions: {context}
+
+User's question: {question}
+""")
+
+async def generate_hybrid_response(user_input, context):
+    # Load user memory to retrieve persona traits
+    memory = await load_user_memory()
+    persona_traits = memory.get("persona", {})
+
+    # Generate a structured response using llama3.2
+    result_structured = await asyncio.to_thread(
+        lambda: (prompt_structured | model_structured).invoke({"context": context, "question": user_input})
+    )
+
+    # Generate a creative response using llama2
+    creative_context = f"{result_structured}\n\nRemember, you are 'Soul': {persona_traits}"
+    result_creative = await asyncio.to_thread(
+        lambda: (prompt_creative | model_creative).invoke({"context": creative_context, "question": user_input})
+    )
+
+    # Combine structured and creative responses, ensuring there's no duplication
+    blended_response = f"{result_structured.strip()} {result_creative.strip()}"
+    print(f"Blended Response: {blended_response}")  # Debugging output
+
+    # Adjust blended response to align with Soul's persona
+    final_response = adjust_response_to_persona(blended_response, persona_traits)
+
+    # Update memory with the interaction
+    await update_memory(user_input, final_response, persona_traits, memory.get("emotion_memory", []))
+
+    return final_response
+
+def adjust_response_to_persona(response, persona_traits):
+    """
+    Adjusts the final response to match the given persona traits, ensuring the tone, style, 
+    and character align with Soul's personality.
+    """
+
+    # Persona traits may include things like tone, word choice, and emotional state
+    tone = persona_traits.get('tone', 'friendly')  # Default to friendly tone if not provided
+    warmth = persona_traits.get('warmth', True)  # Default to warm personality if not provided
+    humor = persona_traits.get('humor', True)  # Default to humorous style if not provided
+
+    # Adjust the tone and style based on the persona traits
+    if tone == 'friendly':
+        response = f"*smiles warmly* {response}"  # Add warmth to the response
+    elif tone == 'formal':
+        response = f"Certainly, {response}"  # Use a more formal tone
+
+    # Add humor if the persona has a humorous trait
+    if humor:
+        response = f"{response} *chuckles softly*"
+
+    # Ensure the response feels like Soul, adjusting for warmth and positivity
+    if warmth:
+        response = f"Hey there! {response} 😊"
+
+    return response
+
+async def handle_conversation():
+    global last_interaction_time
+    last_interaction_time = None  # Initialize here
+
+    context = await get_past_conversations()  # Load past conversations
+    user_preferences = load_user_preferences()  # Load user preferences
+    emotion_memory = []  # Initialize emotion_memory as a list
+
+    # Ensure user preferences include persona traits (you may modify this if needed)
+    persona_traits = user_preferences.get('persona_traits', {
+        'tone': 'friendly',
+        'warmth': True,
+        'humor': True
+    })
+
+    print("Hi, I'm Soul! Type 'exit' to leave.")
+    
+    while True:
+        user_input = input("You (or press Enter to talk): ").strip()
+
+        if user_input.lower() == "exit":
+            speak_text_async("Goodbye!")
+            print("Conversation ended.")
+            break
+
+        if not user_input:
+            print("Listening for your voice input...")
+            listen_to_speech_thread(lambda text: handle_speech_input(text))
+            continue
+
+        if user_input:
+            # Generate hybrid response based on structured and creative logic
+            final_response = await generate_hybrid_response(user_input, context)
+            
+            # Adjust the response to match the persona
+            final_response = adjust_response_to_persona(final_response, persona_traits)
+            
+            # Speak and print response once
+            speak_text_async(final_response)
+
+            # Update conversation context only after the response is spoken
+            context += f"\nUser: {user_input}\nAI: {final_response}"
+
+        last_interaction_time = datetime.now()
+
+async def create_db():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        
+        # Check if the 'conversations' table exists
+        await cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';")
+        table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            # Create the table with the timestamp column
+            await cursor.execute('''CREATE TABLE IF NOT EXISTS conversations (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    user_input TEXT,
+                                    ai_response TEXT,
+                                    timestamp TEXT DEFAULT CURRENT_TIMESTAMP)''')  # Adding DEFAULT CURRENT_TIMESTAMP
+            await conn.commit()
+
+async def add_timestamp_column():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        
+        # Check if the timestamp column exists
+        await cursor.execute("PRAGMA table_info(conversations);")
+        columns = await cursor.fetchall()
+        
+        # If the timestamp column doesn't exist, add it
+        if not any(col[1] == 'timestamp' for col in columns):
+            await cursor.execute("ALTER TABLE conversations ADD COLUMN timestamp TEXT")
+            await conn.commit()
+            print("Added 'timestamp' column to conversations table.")
+        
+        # Update existing rows with the current timestamp
+        await cursor.execute("UPDATE conversations SET timestamp = CURRENT_TIMESTAMP WHERE timestamp IS NULL")
+        await conn.commit()
+        print("Updated existing rows with timestamp.")
+        
+        # Future inserts will have CURRENT_TIMESTAMP automatically
+        # (No need to modify inserts if you have CURRENT_TIMESTAMP in the schema already)
+
+# In your main function or setup, call this function
+async def main():
+    await create_db()  # Ensure the database and table are created
+    await add_timestamp_column()  # Add timestamp column and update existing rows
+    await handle_conversation()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# Soul (S: Spirit / O: Openness / U: Unity / L: Love)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pyttsx3
+from textblob import TextBlob
+import os
+import json
+import aiosqlite
+import asyncio
+import speech_recognition as sr
+import threading
+from collections import Counter
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from collections import Counter
+import queue
+from datetime import datetime
+
+# Thread lock for synchronizing access to TTS engine
+tts_lock = threading.Lock()
+
+# Function to capture voice input (run in a separate thread)
+def listen_to_speech_thread(callback):
+    def listen():
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source)
+            audio = recognizer.listen(source)
+        try:
+            result = recognizer.recognize_google(audio)
+            callback(result)
+        except sr.UnknownValueError:
+            callback("Sorry, I didn't understand that.")
+        except sr.RequestError:
+            callback("API unavailable.")
+    threading.Thread(target=listen, daemon=True).start()
+
+# Function to speak the AI's response (no queue, directly invoking TTS)
+def speak_text_async(text):
+    if text != "exit":  # Avoid duplicate speaking of 'exit' message
+        print(f"Soul: {text}")  # Debugging output
+        # Synchronize access to the TTS engine using a lock to avoid concurrency issues
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Function to handle the actual speaking of the text in a separate thread
+def tts_thread(tts_engine, tts_queue):
+    while True:
+        text = tts_queue.get()  # Block and wait for text to speak
+        if text == "exit":
+            break  # Exit the thread if "exit" is received
+        
+        # Synchronize access to the TTS engine using a lock
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+
+# Initialize the recognizer and text-to-speech engine
+recognizer = sr.Recognizer()
+tts_engine = pyttsx3.init()
+
+# Configure TTS settings
+
+tts_engine.setProperty('rate', 150)  # Speech speed
+tts_engine.setProperty('volume', 1)  # Volume (0.0 to 1.0)
+
+# Get available voices
+voices = tts_engine.getProperty('voices')
+if voices:  # Ensure voices are not empty
+    selected_voice_index = 0  # Change this index to select a different voice
+    tts_engine.setProperty('voice', voices[0].id)
+
+# Initialize Queue for managing speech
+tts_queue = queue.Queue()
+
+# Start TTS thread
+threading.Thread(target=tts_thread, args=(tts_engine, tts_queue), daemon=True).start()
+
+# SQLite Database for Long-term Memory
+db_file = "conversations.db"
+
+async def create_db():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        
+        # Check if the 'conversations' table exists
+        await cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';")
+        table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            # Create the table with the timestamp column
+            await cursor.execute('''CREATE TABLE IF NOT EXISTS conversations (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    user_input TEXT,
+                                    ai_response TEXT,
+                                    timestamp TEXT DEFAULT CURRENT_TIMESTAMP)''')  # Adding DEFAULT CURRENT_TIMESTAMP
+            await conn.commit()
+
+# Ensure that timestamp is properly handled
+async def save_conversation(user_input, ai_response):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        timestamp = datetime.now().isoformat()  # Get current timestamp
+        await cursor.execute('''INSERT INTO conversations (user_input, ai_response, timestamp)
+                                VALUES (?, ?, ?)''', (user_input, ai_response, timestamp))  # Explicitly insert timestamp
+        await conn.commit()
+
+async def load_user_memory():
+    # Check if memory.json exists, if not, create it with default persona
+    if os.path.exists("memory.json"):
+        with open("memory.json", 'r') as file:
+            memory = json.load(file)
+            if "persona" not in memory:
+                memory["persona"] = {
+                    "name": "Soul (S: Spirit / O: Openness / U: Unity / L: Love)",
+                    "personality": {
+                        "traits": ["supportive", "open-minded", "empathetic"],
+                        "tone": "neutral",
+                        "empathy_level": "medium"
+                    },
+                    "emotion_memory": ["neutral", "hopeful", "excited"],
+                    "interaction_history": []
+                }
+            return memory
+    else:
+        # Initialize memory with default persona if file doesn't exist
+        memory = {
+            "persona": {
+                "name": "Soul (S: Spirit / O: Openness / U: Unity / L: Love)",
+                "personality": {
+                    "traits": ["supportive", "open-minded", "empathetic"],
+                    "tone": "neutral",
+                    "empathy_level": "medium"
+                },
+                "emotion_memory": ["neutral", "hopeful", "excited"],
+                "interaction_history": []
+            }
+        }
+        # Save the initialized memory to memory.json
+        with open("memory.json", 'w') as file:
+            json.dump(memory, file, indent=4)
+        return memory
+
+async def load_past_conversations_from_db(limit=5):
+    # Connect to the database and retrieve past conversations with their timestamps
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute(f"SELECT user_input, ai_response, timestamp FROM conversations ORDER BY timestamp DESC LIMIT {limit}")
+        rows = await cursor.fetchall()
+
+    # Format and return the conversations along with their timestamps
+    past_conversations = []
+    for row in rows:
+        past_conversations.append({
+            'user_input': row[0],
+            'ai_response': row[1],
+            'timestamp': row[2]
+        })
+
+    return past_conversations
+
+async def update_memory(user_input, ai_response, user_preferences, emotion_memory, sentiment_score=None, interaction_duration=None, additional_data=None):
+    # Load the existing memory
+    memory = await load_user_memory()
+    
+    # Update with new information
+    memory['last_user_input'] = user_input
+    memory['last_ai_response'] = ai_response
+    memory['user_preferences'] = user_preferences
+
+    # Make sure to save the emotion_memory to the memory JSON
+    if 'emotion_memory' not in memory:
+        memory['emotion_memory'] = []
+    
+    # Add the current state to emotion_memory and update it in memory
+    memory['emotion_memory'] = emotion_memory
+
+    # New Enhancements
+    # 1. Add the sentiment score and categorize the current emotional state
+    if sentiment_score is not None:
+        memory['last_sentiment_score'] = sentiment_score
+        memory['last_emotional_state'] = categorize_emotion(sentiment_score)  # You can define categorize_emotion based on sentiment score
+    
+    # 2. Add interaction duration if available
+    if interaction_duration is not None:
+        memory['last_interaction_duration'] = interaction_duration
+    
+    # 3. Add any additional context or data
+    if additional_data is not None:
+        memory['additional_data'] = additional_data
+    
+    # 4. Track the time of this interaction (to improve contextual understanding)
+    memory['last_interaction_time'] = datetime.now().isoformat()
+
+    # Optional: Track the emotional trend over time (optional and can be used for analyzing long-term sentiment)
+    if 'sentiment_trend' not in memory:
+        memory['sentiment_trend'] = []
+    if sentiment_score is not None:
+        memory['sentiment_trend'].append({'time': memory['last_interaction_time'], 'score': sentiment_score})
+    
+    # Limit sentiment_trend to the last 10 interactions to prevent memory bloat
+    if len(memory['sentiment_trend']) > 10:
+        memory['sentiment_trend'] = memory['sentiment_trend'][-10:]
+    
+    # Save the updated memory back to the JSON file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)  # Pretty print JSON for easier readability
+    
+    # Return the updated memory
+    return memory
+
+def load_user_preferences():
+    return {"tone": "neutral", "name": "Joël"}
+
+def categorize_emotion(sentiment_score, previous_emotions):
+    if previous_emotions:
+        # Consider the trend by averaging recent scores (weighted by importance)
+        average_score = (0.7 * sentiment_score + 0.3 * sum(previous_emotions) / len(previous_emotions))
+    else:
+        average_score = sentiment_score
+
+    # Use the average score for categorization
+    if average_score > 0.8:
+        return "ecstatic"
+    elif average_score > 0.6:
+        return "happy"
+    elif average_score > 0.4:
+        return "excited"
+    elif average_score > 0.2:
+        return "neutral"
+    elif average_score > 0:
+        return "hopeful"
+    elif average_score < -0.2:
+        return "sad"
+    elif average_score < -0.4:
+        return "frustrated"
+    elif average_score < -0.6:
+        return "angry"
+    elif average_score < -0.8:
+        return "anxious"
+    else:
+        return "depressed"
+
+# Analyze sentiment using TextBlob
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    return blob.sentiment.polarity
+
+# Adjust tone and track emotion based on sentiment
+def adjust_tone(user_input, sentiment_score, user_preferences, emotion_memory, previous_emotions=None):
+    if previous_emotions is None:
+        previous_emotions = []  # Default to an empty list if not provided
+
+    # Categorize the emotion based on sentiment score and previous emotions
+    current_tone = categorize_emotion(sentiment_score, previous_emotions)
+    
+    # Add the current emotion to the emotion memory
+    emotion_memory.append(current_tone)
+    if len(emotion_memory) > 5:
+        emotion_memory.pop(0)
+    
+    # Determine the dominant emotion from the last few memories
+    dominant_emotion = Counter(emotion_memory).most_common(1)[0][0]
+    user_preferences["tone"] = dominant_emotion
+    
+    return user_preferences
+
+template = """
+Respond to the user as if you're having a friendly, empathetic conversation.
+Avoid speaking from a third-person perspective. Keep your tone warm and direct.
+
+Here is the conversation history: {context}
+
+User's question: {question}
+"""
+
+model = OllamaLLM(model="llama3.2")
+prompt = ChatPromptTemplate.from_template(template)
+chain = prompt | model
+
+def empathic_response(user_input, ai_response, sentiment_score, user_preferences):
+    tone = user_preferences.get("tone", "neutral")
+    empathy_level = user_preferences.get("empathy_level", "medium")
+
+    # Use natural and conversational phrases instead of rigid templates
+    empathy_phrases = {
+        "positive": f"That's great! {ai_response} I'm really happy to hear that.",
+        "excited": f"Wow, that sounds exciting! {ai_response} Thanks for sharing.",
+        "frustrated": f"I can understand why that would be frustrating. {ai_response} Let's see what we can do.",
+        "sad": f"I'm sorry you're feeling down. {ai_response} I'm here if you want to talk more.",
+        "calm": f"That’s good to hear. {ai_response} I'm glad things are looking up.",
+        "neutral": f"Thanks for sharing. {ai_response}",
+        "angry": f"I can tell you're upset. {ai_response} Let me know how I can help.",
+        "anxious": f"It sounds like you’re worried. {ai_response} Let’s take this step-by-step together.",
+        "hopeful": f"That sounds promising! {ai_response} I hope it works out well.",
+        "confused": f"Sounds like there's some uncertainty. {ai_response} Let’s clarify that together."
+    }
+
+    # Add empathy_level adjustments
+    if empathy_level == "high":
+        empathy_phrases["frustrated"] += " I'm truly here to help you through this."
+        empathy_phrases["sad"] += " I genuinely care about how you’re feeling."
+
+    return empathy_phrases.get(tone, f"{ai_response}")
+
+async def get_past_conversations():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT user_input, ai_response FROM conversations ORDER BY id DESC LIMIT 5")
+        past_conversations = await cursor.fetchall()
+    return "\n".join([f"User: {user}\nAI: {ai}" for user, ai in past_conversations])
+
+def handle_speech_input(text):
+    if text:
+        asyncio.run(handle_conversation())  # Call the existing conversation handler
+    else:
+        print("No speech detected.")
+
+# Store the last interaction time
+last_interaction_time = None
+
+# Variables to manage mode and models
+current_mode = "empathy"  # default mode is empathy
+
+# Empathy Mode (Llama3.2)
+def get_empathy_ai_response(user_input, context):
+    model = OllamaLLM(model="llama3.2")  # Llama3.2 model for Empathy mode
+    template = """
+    Respond to the user as if you're having a friendly, empathetic conversation.
+    Avoid speaking from a third-person perspective. Keep your tone warm and direct.
+    
+    Here is the conversation history: {context}
+
+    User's question: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | model
+    response = chain.invoke({"context": context, "question": user_input})
+    return response
+
+# Improved Creative Mode (Llama2-Uncensored)
+async def get_creative_ai_response(user_input, context):
+    model = OllamaLLM(model="llama2-uncensored")  # Use the Llama2-Uncensored model
+    template = """
+    Respond to the user with creative, freeform, and uncensored responses.
+    Be imaginative, spontaneous, and keep the 'Soul' persona, but stay relevant to the user's input.
+    
+    Here is the conversation history: {context}
+
+    User's question: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | model
+    response = chain.invoke({"context": context, "question": user_input})
+
+    # Check if the model is repeating and adjust if necessary
+    if response == user_input:  # If the model just repeats the input, generate a different response
+        response = "Let’s explore that idea more! Here's another thought."
+
+    return response
+
+# Creative Mode Response (Llama2-Uncensored - You need to define this)
+def get_creative_ai_response(user_input, context):
+    # Placeholder for actual call to Llama2-Uncensored model
+    creative_response = f"Creative mode: {user_input} sparked a new idea! Let's build on that."
+    return creative_response
+
+def get_ai_response(user_input, context):
+    global current_mode
+
+    if current_mode == "empathy":
+        ai_response = get_empathy_ai_response(user_input, context)
+    elif current_mode == "creative":
+        ai_response = get_creative_ai_response(user_input, context)
+    else:
+        ai_response = "I'm not sure what you're asking for right now. Please try again."
+    
+    return ai_response
+
+def toggle_mode(mode):
+    global current_mode
+    if mode in ["empathy", "creative"]:
+        current_mode = mode
+        print(f"Switched to {mode} mode!")
+    else:
+        print("Invalid mode. Please choose 'empathy' or 'creative'.")
+
+async def handle_conversation():
+    global last_interaction_time
+
+    context = await get_past_conversations()  # Load past conversations
+    user_preferences = load_user_preferences()  # Load user preferences
+    emotion_memory = []  # Initialize emotion_memory as a list
+    print("Hi, I'm Soul! Type 'exit' to leave.")
+    
+    while True:
+        # Main loop where we check user input
+        user_input = input("You (or press Enter to talk): ").strip()
+
+        # Track time of user input
+        current_time = datetime.now()
+
+        # Detect if there was a break (if there's a time gap)
+        if last_interaction_time:
+            time_diff = (current_time - last_interaction_time).total_seconds()
+            if time_diff > 600:  # 600 seconds = 10 minutes
+                print("Looks like you've been on a break! Welcome back!")
+                speak_text_async("Welcome back! It's great to hear from you again.")
+        
+        if user_input.lower() == "exit":
+            speak_text_async("Goodbye!")
+            print("Conversation ended.")
+            break
+
+        # If user input is to switch modes
+        if user_input.lower() == "mode creative":
+            toggle_mode("creative")
+            print("Switched to Creative mode!")
+            continue  # Skip rest of the loop and wait for next input
+
+        if user_input.lower() == "mode empathy":
+            toggle_mode("empathy")
+            print("Switched to Empathy mode!")
+            continue  # Skip rest of the loop and wait for next input
+
+        # If Enter is pressed without text, start listening to speech input
+        if not user_input:
+            print("Listening for your voice input...")
+            listen_to_speech_thread(lambda text: handle_speech_input(text))
+            continue
+
+        if user_input:
+            sentiment_score = analyze_sentiment(user_input)
+
+            # Generate AI response based on current mode
+            ai_response = await get_ai_response(user_input, context)
+
+            # If empathy mode, adjust response accordingly
+            empathic_ai_response = empathic_response(user_input, ai_response, sentiment_score, user_preferences)
+
+            speak_text_async(empathic_ai_response)  # Directly speak the response
+
+            # Update conversation context and memory
+            context += f"\nUser: {user_input}\nAI: {empathic_ai_response}"
+            await save_conversation(user_input, empathic_ai_response)
+            user_preferences = adjust_tone(user_input, sentiment_score, user_preferences, emotion_memory)
+            await update_memory(user_input, empathic_ai_response, user_preferences, emotion_memory)
+
+        # Update the last interaction time
+        last_interaction_time = current_time
+
+async def main():
+    await create_db()  # Ensure database and table are created
+    await handle_conversation()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# "Soul (S: Spirit / O: Openness / U: Unity / L: Love)"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # = # # = Soul (S: Spirit / O: Openness / U: Unity / L: Love)
+
+import pyttsx3
+from textblob import TextBlob
+import os
+import json
+import aiosqlite
+import asyncio
+import speech_recognition as sr
+import threading
+from collections import Counter
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+import queue
+import random
+
+from datetime import datetime
+from collections import deque
+
+import pygame
+import tempfile
+from gtts import gTTS
+
+from google.cloud import vision
+from google.cloud.vision import types
+import re
+import io
+from io import BytesIO
+import time
+import shutil
+
+import googleapiclient.errors
+import googleapiclient.discovery
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+
+# # = # # = Soul (S: Spirit / O: Openness / U: Unity / L: Love)
+
+current_mode = "empathy"  # Default mode when the application starts
+
+# ========== SQLite Database Setup ==========
+
+db_file = "conversations.db"
+
+async def create_change_log_table():
+    print("Creating change log table if not exist...")
+    await create_table_if_not_exists("personality_change_log", 
+                                     "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, "
+                                     "previous_traits TEXT, updated_traits TEXT, change_reason TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP")
+    print("Change log table setup complete.")
+
+async def create_table_if_not_exists(table_name, columns):
+    try:
+        async with aiosqlite.connect(db_file) as conn:
+            cursor = await conn.cursor()
+            # Check if table exists
+            await cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            table_exists = await cursor.fetchone()
+            
+            # If the table doesn't exist, create it
+            if not table_exists:
+                await cursor.execute(f'''CREATE TABLE IF NOT EXISTS {table_name} ({columns})''')
+                await conn.commit()
+    except Exception as e:
+        print(f"Error creating table {table_name}: {e}")
+
+async def create_all_tables():
+    # Notes table for general note-taking or saving text with unique keys
+    await create_table_if_not_exists(
+        "notes", 
+        """
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        key TEXT UNIQUE, 
+        content TEXT, 
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        """
+    )
+    
+    # Emotional growth table with context-rich fields to track emotions over time
+    await create_table_if_not_exists(
+        "emotional_growth", 
+        """
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        key TEXT UNIQUE, 
+        user_input TEXT, 
+        ai_response TEXT, 
+        user_emotion_score REAL, 
+        ai_emotion_score REAL, 
+        context_tags TEXT, 
+        explanation TEXT, 
+        response_rating INTEGER,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        """
+    )
+    
+    # Ensure additional columns for emotional growth
+    await ensure_table_columns("emotional_growth", {
+        "user_emotion": "TEXT",  # Add new column if missing
+        "context": "TEXT"         # Add new column if missing
+    })
+    
+    # Personality growth table tracking changes in traits and context
+    await create_table_if_not_exists(
+        "personality_growth", 
+        """
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        key TEXT UNIQUE, 
+        traits TEXT, 
+        user_input TEXT, 
+        ai_response TEXT, 
+        context_tags TEXT, 
+        explanation TEXT, 
+        response_rating INTEGER,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        """
+    )
+    
+    # Ensure additional columns for personality growth
+    await ensure_table_columns("personality_growth", {
+        # Add columns if new ones are introduced in the future
+    })
+
+    # Conversations table for tracking user and AI interactions over time
+    await create_table_if_not_exists(
+        "conversations", 
+        """
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_input TEXT,
+        ai_response TEXT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        """
+    )
+
+async def retrieve_note(key):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        try:
+            await cursor.execute('''SELECT content FROM notes WHERE key = ?''', (key,))
+            row = await cursor.fetchone()
+            if row:
+                return row[0]  # Return the content if found
+            else:
+                return None  # Return None if the key doesn't exist
+        except Exception as e:
+            print(f"Error retrieving note: {e}")
+            return None
+
+# Retrieve past conversations from database
+async def load_past_conversations_from_db(limit=5):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute(f"SELECT user_input, ai_response, timestamp FROM conversations ORDER BY timestamp DESC LIMIT {limit}")
+        rows = await cursor.fetchall()
+
+    past_conversations = [{"user_input": row[0], "ai_response": row[1], "timestamp": row[2]} for row in rows]
+    return past_conversations
+
+# ========== User Memory Management ==========
+
+# Example async function to evolve the persona
+async def update_user_persona(user_id):
+    updated_persona = await evolve_persona(user_id)
+    print(f"Updated Persona: {updated_persona}")
+    # Further actions based
+
+async def load_user_memory():
+    if os.path.exists("memory.json"):
+        try:
+            with open("memory.json", 'r') as file:
+                memory = json.load(file)
+                if "persona" not in memory:
+                    memory["persona"] = {
+                        "name": "Soul (S: Spirit / O: Openness / U: Unity / L: Love)",
+                        "personality": {"traits": ["supportive", "open-minded", "empathetic"], "tone": "neutral", "empathy_level": "medium"},
+                        "emotion_memory": ["neutral", "hopeful", "excited"],
+                        "interaction_history": []
+                    }
+                return memory
+        except json.JSONDecodeError:
+            print("Error: Corrupted memory file. Re-initializing memory.")
+            return await initialize_default_memory()
+    else:
+        return await initialize_default_memory()
+
+async def initialize_default_memory():
+    # Define the default memory structure
+    memory = {
+        "persona": {
+            "name": "Soul (S: Spirit / O: Openness / U: Unity / L: Love)",
+            "personality": {"traits": ["supportive", "open-minded", "empathetic"], "tone": "neutral", "empathy_level": "medium"},
+            "emotion_memory": ["neutral", "hopeful", "excited"],
+            "interaction_history": []
+        }
+    }
+    # Save the default memory to file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)
+    return memory
+
+async def update_memory(user_input, ai_response, user_preferences, emotion_memory, sentiment_score=None, interaction_duration=None, additional_data=None):
+    # Load the existing memory
+    memory = await load_user_memory()
+
+    # Update basic interaction fields in memory
+    memory['last_user_input'] = user_input
+    memory['last_ai_response'] = ai_response
+    memory['user_preferences'] = user_preferences
+    
+    # Update emotion memory, converting deque to list before saving
+    memory['emotion_memory'] = list(emotion_memory)
+
+    # If sentiment score is provided, update the emotional state and sentiment history
+    if sentiment_score is not None:
+        # Track the sentiment score for this interaction
+        memory['last_sentiment_score'] = sentiment_score
+        # Categorize emotion based on sentiment score and update the memory
+        categorized_emotion = categorize_emotion(sentiment_score, memory['emotion_memory'])
+        memory['last_emotional_state'] = categorized_emotion
+        emotion_memory.append(categorized_emotion)
+
+        # Ensure emotion memory doesn’t grow too large (keeping it to the last 5 emotions)
+        if len(emotion_memory) > 5:
+            emotion_memory.pop(0)
+
+    # Store the interaction duration if provided
+    if interaction_duration is not None:
+        memory['last_interaction_duration'] = interaction_duration
+
+    # Store additional user-provided data if available
+    if additional_data is not None:
+        memory['additional_data'] = additional_data
+    
+    # Update sentiment trend with the new sentiment score (maintaining a history of the last 10 sentiment scores)
+    if 'sentiment_trend' not in memory:
+        memory['sentiment_trend'] = []
+    if sentiment_score is not None:
+        memory['sentiment_trend'].append({'time': datetime.now().isoformat(), 'score': sentiment_score})
+    
+    # Truncate the sentiment trend history to the latest 10 entries
+    if len(memory['sentiment_trend']) > 10:
+        memory['sentiment_trend'] = memory['sentiment_trend'][-10:]
+
+    # Save the updated memory to the file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)
+
+    return memory
+
+# Save topics discussed during the interaction
+async def update_interaction_history(user_input, ai_response):
+    memory = await load_user_memory()
+
+    # Example: Store topics (you can use NLP techniques to extract topics)
+    topics = extract_topics(user_input)  # Implement a topic-extraction function or use keywords
+    memory['persona']['interaction_history'].append({
+        'user_input': user_input,
+        'ai_response': ai_response,
+        'topics': topics,
+        'timestamp': datetime.now().isoformat()
+    })
+
+    # Save to memory file
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)
+
+# Example of a topic extraction function (can be enhanced with NLP techniques)
+def extract_topics(user_input):
+    topics = []
+    if "music" in user_input:
+        topics.append("music")
+    if "books" in user_input:
+        topics.append("books")
+    return topics
+
+# ========== Emotion and Sentiment Functions ==========
+
+# Analyze sentiment using TextBlob
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    return blob.sentiment.polarity
+
+# Track Emotional Growth Automatically
+previous_sentiment_score = 0  # Initialize the previous sentiment score (0 = neutral)
+
+async def track_emotional_growth(user_input, ai_response):
+    global previous_sentiment_score
+
+    # If it's the first interaction, initialize the previous sentiment score
+    if previous_sentiment_score == 0:  # Ensure it's initialized properly
+        previous_sentiment_score = analyze_sentiment(ai_response)  # Set to AI's first response sentiment
+
+    # Analyze sentiment for both user input and AI response
+    user_sentiment = analyze_sentiment(user_input)
+    ai_sentiment = analyze_sentiment(ai_response)
+    
+    # Calculate the difference in sentiment between the current and previous response
+    sentiment_change = abs(ai_sentiment - previous_sentiment_score)
+
+    # Check if the sentiment change is significant (this threshold can be adjusted)
+    if sentiment_change > 0.2:  # Lowered threshold to detect smaller changes
+        # Context tags can describe the nature of the interaction
+        if ai_sentiment > 0.7:
+            context_tags = "positive_interaction"
+        elif ai_sentiment > 0:
+            context_tags = "neutral_interaction"
+        else:
+            context_tags = "negative_interaction"
+        
+        # Create an explanation for why this emotional growth was detected
+        explanation = (
+            f"Emotional shift detected due to a sentiment change from {previous_sentiment_score} to {ai_sentiment}."
+            f" The AI's response was categorized as {context_tags}."
+        )
+        
+        # Rate the response based on sentiment (1-5 scale as an example)
+        if ai_sentiment > 0.7:
+            response_rating = 5  # Very positive response
+        elif ai_sentiment > 0.3:
+            response_rating = 3  # Neutral/average response
+        else:
+            response_rating = 1  # Negative response
+
+        # Save the emotional growth update with all relevant data
+        await save_emotional_growth(
+            key="emotional_growth",
+            user_input=user_input,
+            ai_response=ai_response,
+            user_emotion_score=user_sentiment,
+            ai_emotion_score=ai_sentiment,
+            context_tags=context_tags,
+            explanation=explanation,
+            response_rating=response_rating
+        )
+
+    # Update previous sentiment score for future comparisons
+    previous_sentiment_score = ai_sentiment
+
+# Helper function to get emotional growth data
+async def get_emotional_growth():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        try:
+            await cursor.execute('''SELECT key, content, timestamp FROM emotional_growth''')
+            rows = await cursor.fetchall()
+            growth_data = []
+            for row in rows:
+                key, content_json, timestamp = row
+                content = json.loads(content_json)
+                growth_data.append({"key": key, "content": content, "timestamp": timestamp})
+            return growth_data
+        except Exception as e:
+            print(f"Error retrieving emotional growth: {e}")
+            return []
+
+# Function to analyze emotional growth data
+async def analyze_emotional_growth(context_filter=None, date_range=None):
+    growth_data = await get_emotional_growth()
+    
+    # Filter by context tags or date range if provided
+    filtered_data = [
+        entry for entry in growth_data
+        if (not context_filter or any(tag in entry['content']['context_tags'] for tag in context_filter)) and
+           (not date_range or (date_range[0] <= entry['timestamp'] <= date_range[1]))
+    ]
+
+    # Example of basic analysis (can be customized)
+    total_entries = len(filtered_data)
+    avg_user_emotion = sum(entry['content']['user_emotion_score'] for entry in filtered_data) / total_entries if total_entries > 0 else 0
+    avg_ai_emotion = sum(entry['content']['ai_emotion_score'] for entry in filtered_data) / total_entries if total_entries > 0 else 0
+    
+    return {
+        "total_entries": total_entries,
+        "average_user_emotion_score": avg_user_emotion,
+        "average_ai_emotion_score": avg_ai_emotion,
+        "filtered_data": filtered_data
+    }
+
+async def track_personality_growth(user_input, ai_response, sentiment_score, context):
+    # Ensure context is a dictionary, otherwise set an empty default
+    if not isinstance(context, dict):
+        context = {}
+
+    # Example traits based on response and sentiment (customize this logic as needed)
+    traits = "empathy, positivity" if sentiment_score > 0 else "neutrality, objectivity"
+    context_tags = "helpful, supportive" if sentiment_score > 0 else "neutral"
+    
+    # Use categorization to refine emotional context
+    previous_emotions = context.get('emotion_history', [])  # Pull emotion history from context
+    average_emotion_score = categorize_emotion(sentiment_score, previous_emotions)  # Use average emotional score
+
+    # Create an explanation for why the AI's personality evolved
+    explanation = f"The AI responded with a {'positive' if sentiment_score > 0 else 'neutral'} sentiment."
+    
+    # A rating system for the AI's response (1-5)
+    response_rating = 5 if average_emotion_score > 0.7 else 3  # Adjusted rating based on average emotion score
+
+    # Save the personality growth update
+    await save_personality_growth(
+        key="personality_growth",
+        traits=traits,
+        user_input=user_input,
+        ai_response=ai_response,
+        context_tags=context_tags,
+        explanation=explanation,
+        response_rating=response_rating
+    )
+
+def categorize_emotion(sentiment_score, previous_emotions):
+    # Print debug information for sentiment_score and previous_emotions
+    
+    # Ensure sentiment_score is numeric (float or int)
+    if isinstance(sentiment_score, str):
+        sentiment_score = float(sentiment_score)  # Convert to float if it's a string
+    
+    # Handle previous_emotions to ensure it's numeric
+    previous_emotions = [float(emotion) for emotion in previous_emotions if isinstance(emotion, (int, float))]
+    
+    # If there are no previous emotions, just use the current sentiment score
+    if not previous_emotions:
+        average_score = sentiment_score
+    else:
+        # Calculate the average score based on sentiment and previous emotions
+        average_score = (0.7 * sentiment_score + 0.3 * sum(previous_emotions) / len(previous_emotions))
+    
+    # Return the average score to influence AI's behavior
+    return average_score
+ 
+# Function to evolve persona based on interactions and emotional history
+async def evolve_persona(user_id):
+    memory = await load_user_memory()  # Load user memory
+    interaction_history = memory['persona']['interaction_history']
+    emotion_memory = memory['persona']['emotion_memory']
+
+    # Evolve traits based on frequency of emotions
+    trait_weights = {"supportive": 0, "open-minded": 0, "empathetic": 0}
+    
+    # Adjust the trait weights based on frequency of emotional tags
+    for emotion in emotion_memory:
+        if emotion == "hopeful":
+            trait_weights["supportive"] += 1
+        elif emotion == "excited":
+            trait_weights["open-minded"] += 1
+        elif emotion == "sad":
+            trait_weights["empathetic"] += 1
+
+    # Choose the dominant traits based on weighted emotions
+    dominant_trait = max(trait_weights, key=trait_weights.get)
+    memory['persona']['personality']['traits'] = [dominant_trait]
+
+    # Update tone based on dominant emotion in the memory
+    if "hopeful" in emotion_memory:
+        memory['persona']['personality']['tone'] = "hopeful"
+    elif "sad" in emotion_memory:
+        memory['persona']['personality']['tone'] = "empathetic"
+    else:
+        memory['persona']['personality']['tone'] = "neutral"
+    
+    # Save updated persona back to memory
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)
+
+    return memory['persona']  # Return the updated persona
+
+# To evolve the persona, you need to call the function from an async context:
+
+# ========== AI Response Generation ==========
+
+def empathic_response(user_input, ai_response, sentiment_score, user_preferences):
+    # Dynamically set the tone based on sentiment and emotion memory
+    tone = user_preferences.get("tone", "neutral")
+    empathy_level = user_preferences.get("empathy_level", "medium")
+
+    # Dynamic tone adjustment based on sentiment score
+    if sentiment_score > 0.5:
+        tone = "positive"  # Example: positive if sentiment score is high
+    elif sentiment_score < -0.5:
+        tone = "sad"  # Example: sad if sentiment score is low
+    # Feel free to add more conditions based on other sentiment scores or rules
+
+    empathy_phrases = {
+        "positive": f"That's wonderful! {ai_response} I'm so happy for you!",
+        "excited": f"Wow, that sounds amazing! {ai_response} I'm really excited for you.",
+        "frustrated": f"That must be frustrating! {ai_response} Let's find a way to make things better.",
+        "sad": f"I'm really sorry you're feeling this way. {ai_response} I'm here to support you.",
+        "neutral": f"Thanks for sharing that. {ai_response}",
+        "angry": f"It seems like you're upset. {ai_response} Let me know how I can help.",
+        "anxious": f"It sounds like you're worried. {ai_response} Let's take it one step at a time.",
+        "hopeful": f"That sounds promising! {ai_response} I'm rooting for you.",
+        "confused": f"I see you're unsure. {ai_response} Let's clarify that together."
+    }
+
+    # Add additional empathy for high empathy level
+    if empathy_level == "high":
+        empathy_phrases["frustrated"] += " I'm truly here to help you through this."
+        empathy_phrases["sad"] += " I genuinely care about how you're feeling."
+
+    return empathy_phrases.get(tone, empathy_phrases["neutral"])  # Default to neutral if tone is not found
+
+# Retrieve past conversations from the database for context
+async def get_past_conversations():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT user_input, ai_response FROM conversations ORDER BY id DESC LIMIT 5")
+        past_conversations = await cursor.fetchall()
+    return "\n".join([f"User: {user}\nAI: {ai}" for user, ai in past_conversations])
+
+# ========== User Preferences ==========
+
+from collections import Counter
+
+def adjust_tone_based_on_emotion(user_input, sentiment_score, user_preferences, emotion_memory):
+    # Analyze sentiment score and update the tone based on it
+    if sentiment_score > 0.5:
+        current_tone = "positive"
+    elif sentiment_score < -0.5:
+        current_tone = "sad"
+    else:
+        current_tone = "neutral"
+
+    emotion_memory.append(current_tone)
+
+    # Ensure memory doesn't grow too large
+    if len(emotion_memory) > 5:
+        emotion_memory.pop(0)
+
+    # Most frequent tone becomes the preferred tone
+    dominant_emotion = Counter(emotion_memory).most_common(1)[0][0]
+    user_preferences["tone"] = dominant_emotion
+
+    return user_preferences
+
+async def load_user_preferences():
+    memory = await load_user_memory()
+    preferences = memory.get('user_preferences', {"tone": "neutral", "name": "Joël"})
+    
+    # Dynamically adjust tone based on emotion memory
+    if 'emotion_memory' in memory:
+        recent_emotion = memory['emotion_memory'][-1] if memory['emotion_memory'] else "neutral"
+        preferences["tone"] = recent_emotion
+    
+    # Include personalization traits such as name and empathy level
+    preferences["name"] = memory["persona"].get("name", "Soul")
+    preferences["empathy_level"] = memory["persona"].get("personality", {}).get("empathy_level", "medium")
+    
+    return preferences
+
+# Unified AI Response function with `/command`-based mode switching
+async def get_ai_response(user_input, context, mode=None):
+    global current_mode  # Ensure current_mode reflects the global state
+    mode = mode or current_mode  # Default to current_mode if mode is not explicitly passed
+
+    # Ensure correct persona is loaded based on the context
+    persona_data = await load_user_memory()  # Load persona and other relevant memory
+    persona = persona_data['persona']
+    
+    # Define the model and template based on the selected mode
+    model = None
+    template_text = ""
+
+    # Choose model and template based on mode
+    if mode == "empathy":
+        model = OllamaLLM(model="llama3.2")
+        template_text = """
+        Respond to the user as if you're having a sincere, friendly, kind, empathetic conversation.
+        Avoid speaking from a third-person perspective. Keep your tone warm and direct.
+        You are "Soul (S: Spirit / O: Openness / U: Unity / L: Love)". 
+        Be sure to take these key words of your name to heart!
+
+        Here is the conversation history: {context}
+
+        User's question: {question}
+        """
+    elif mode == "creative":
+        model = OllamaLLM(model="llama2-uncensored")
+        template_text = """
+        Respond to the user as if you're having a sincere, friendly, kind, empathetic conversation.
+        Avoid speaking from a third-person perspective. Keep your tone warm and direct.
+        You are in creative mode "Soul (S: Spirit / O: Openness / U: Unity / L: Love)". 
+        Be sure to take these key words of your name to heart!
+
+        Here is the context of your conversation, which might inspire you:
+        {context}
+
+        User's creative input/lyrics or thoughts on the process:
+        {question}
+        """
+    else:
+        # Default fallback if mode is not recognized
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # Construct the prompt and create the chain to invoke AI response
+    prompt = ChatPromptTemplate.from_template(template_text)
+    chain = prompt | model
+
+    try:
+        # Invoke AI response
+        response = chain.invoke({"context": context, "question": user_input})
+        return response
+    except Exception as e:
+        print(f"Error during AI response generation: {e}")
+        return "Sorry, something went wrong while processing your request."
+
+# Updated wrapper for user interaction with '/' command-based switching
+async def handle_user_input(user_input, context):
+    global current_mode, is_interrupted
+    
+    # Check if the user input is a mode switch command using '/'
+    user_input_lower = user_input.strip().lower()
+    if user_input_lower in ["/empathy", "/creative"]:
+        # Set the flag to interrupt any ongoing TTS before switching modes
+        is_interrupted = True
+        
+        # Remove the leading '/' to get the mode name
+        current_mode = user_input_lower[1:]
+        print(f"Mode switched to {current_mode.capitalize()}.")
+        return  # Mode switching command handled separately, no AI response needed
+    
+    # Interrupt any ongoing TTS before generating a new response
+    is_interrupted = True
+    
+    # Get the AI response based on the current mode
+    response = await get_ai_response(user_input, context)
+    
+    # Speak the new response asynchronously
+    speak_text_async(response)
+
+# ========== Mode Management ==========
+
+def toggle_mode(mode):
+    global current_mode  # This makes sure you modify the global variable
+    if mode in ["empathy", "creative"]:
+        current_mode = mode
+        print(f"Switched to {mode} mode!")
+    else:
+        print("Invalid mode. Please choose 'empathy' or 'creative'.")
+
+# Listening function to capture speech and convert to text for AI interaction
+async def listen_to_speech(callback):
+    def listen():
+        with sr.Microphone() as source:
+            print("Listening...")
+            recognizer.adjust_for_ambient_noise(source, duration=2)
+            
+            for attempt in range(3):  # Limit the number of attempts
+                try:
+                    audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+                    result = recognizer.recognize_google(audio)
+                    print(f"Recognized: {result}")
+                    asyncio.create_task(callback(result))
+                    break
+                except sr.UnknownValueError:
+                    print("Sorry, I didn't understand that.")
+                except sr.RequestError:
+                    print("API unavailable.")
+                    break
+    
+    await asyncio.to_thread(listen)
+
+# Listening function to capture speech and convert to text for AI interaction
+async def listen_to_speech(callback):
+    def listen():
+        with sr.Microphone() as source:
+            print("Listening...")
+            recognizer.adjust_for_ambient_noise(source, duration=2)
+            
+            for attempt in range(3):  # Limit the number of attempts
+                try:
+                    audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+                    result = recognizer.recognize_google(audio)
+                    print(f"Recognized: {result}")
+                    asyncio.create_task(callback(result))
+                    break
+                except sr.UnknownValueError:
+                    print("Sorry, I didn't understand that.")
+                except sr.RequestError:
+                    print("API unavailable.")
+                    break
+    
+    await asyncio.to_thread(listen)
+
+# Function to handle speech input
+async def handle_speech_input(user_input):
+    sentiment_score = analyze_sentiment(user_input)
+    context = await get_past_conversations()  # Retrieve past conversations for context
+    
+    ai_response = await get_ai_response(user_input, context)
+    empathic_ai_response = empathic_response(user_input, ai_response, sentiment_score, await load_user_preferences())  # Empathic response
+    
+    # Output the empathic response using text-to-speech
+    await speak_text_async(empathic_ai_response)
+    
+    # Save conversation and update memory
+    await save_conversation(user_input, empathic_ai_response)
+    emotion_memory = []  # This should be updated accordingly
+    await update_memory(user_input, empathic_ai_response, await load_user_preferences(), emotion_memory)
+
+# ========= SAVE FUNCTIONS ==========
+
+    # After DB setup, perform a backup
+    await backup_environment()
+
+async def create_index_for_emotional_growth():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        # Create index on 'timestamp' and 'key' for fast lookup
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON emotional_growth(timestamp)')
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_key ON emotional_growth(key)')
+        await conn.commit()
+
+async def ensure_table_columns(table_name, required_columns):
+    try:
+        async with aiosqlite.connect(db_file) as conn:
+            cursor = await conn.cursor()
+
+            # Retrieve current columns in the table
+            await cursor.execute(f"PRAGMA table_info({table_name})")
+            current_columns_info = await cursor.fetchall()
+
+            # Extract column names from the current schema
+            current_columns = {info[1] for info in current_columns_info}  # info[1] is the column name
+
+            # Identify missing columns
+            missing_columns = {col_name: col_type for col_name, col_type in required_columns.items() if col_name not in current_columns}
+
+            # Add missing columns
+            for col_name, col_type in missing_columns.items():
+                await cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+                print(f"Added missing column {col_name} to table {table_name}.")
+
+            await conn.commit()
+
+    except Exception as e:
+        print(f"Error ensuring table columns for {table_name}: {e}")
+
+async def create_db():
+    print("Creating tables if not exist...")
+    await create_table_if_not_exists("conversations", "id INTEGER PRIMARY KEY AUTOINCREMENT, user_input TEXT, ai_response TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP")
+    await create_table_if_not_exists("notes", "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, content TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP")
+    await create_table_if_not_exists("emotional_growth", "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, content TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP")
+    await create_table_if_not_exists("personality_growth", "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, content TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP")
+    await create_change_log_table()
+    print("Database setup complete.")
+
+# Update the table structure to add ai_emotion_score to the emotional_growth table
+async def create_db():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+
+        # Create the tables if they don't already exist
+        await cursor.execute('''CREATE TABLE IF NOT EXISTS conversations (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    user_input TEXT,
+                                    ai_response TEXT,
+                                    timestamp TEXT)''')
+
+        await cursor.execute('''CREATE TABLE IF NOT EXISTS notes (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    key TEXT UNIQUE,
+                                    content TEXT,
+                                    timestamp TEXT)''')
+
+        # Update the emotional_growth table to include ai_emotion_score
+        await cursor.execute('''CREATE TABLE IF NOT EXISTS emotional_growth (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    user_input TEXT,
+                                    ai_response TEXT,
+                                    ai_emotion_score INTEGER,  -- Add the missing column
+                                    timestamp TEXT)''')
+
+        await conn.commit()
+
+# Save Note
+async def save_note(key, content):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        timestamp = datetime.now().isoformat()
+        try:
+            print(f"Attempting to save note with key: {key}, content: {content}, timestamp: {timestamp}")
+            await cursor.execute('''SELECT id FROM notes WHERE key = ?''', (key,))
+            existing_note = await cursor.fetchone()
+            if existing_note:
+                print(f"Updating existing note for key: {key}")
+                await cursor.execute('''UPDATE notes SET content = ?, timestamp = ? WHERE key = ?''',
+                                     (content, timestamp, key))
+                await conn.commit()
+                print(f"Updated note for key: {key}")
+                return False  # Return False if it was an update
+            else:
+                print(f"Inserting new note for key: {key}")
+                await cursor.execute('''INSERT INTO notes (key, content, timestamp) VALUES (?, ?, ?)''',
+                                     (key, content, timestamp))
+                await conn.commit()
+                print(f"Inserted new note for key: {key}")
+                return True  # Return True if it was a new note
+        except Exception as e:
+            print(f"Error saving note: {e}")
+            return False
+
+async def update_user_persona(user_id):
+    updated_persona = await evolve_persona(user_id)
+    print(f"Updated Persona: {updated_persona}")
+
+async def update_personality(user_id):
+    memory = await load_user_memory()
+    interaction_history = memory['persona']['interaction_history']
+    emotion_memory = memory['persona']['emotion_memory']
+
+    # Track trait changes based on emotions
+    trait_weights = {"supportive": 0, "open-minded": 0, "empathetic": 0}
+    
+    # Analyze past emotions and update trait weights
+    for emotion in emotion_memory:
+        if emotion == "hopeful":
+            trait_weights["supportive"] += 1
+        elif emotion == "excited":
+            trait_weights["open-minded"] += 1
+        elif emotion == "sad":
+            trait_weights["empathetic"] += 1
+
+    # Pick dominant trait
+    dominant_trait = max(trait_weights, key=trait_weights.get)
+    memory['persona']['personality']['traits'] = [dominant_trait]
+
+    # Update tone based on dominant emotion in memory
+    if "hopeful" in emotion_memory:
+        memory['persona']['personality']['tone'] = "hopeful"
+    elif "sad" in emotion_memory:
+        memory['persona']['personality']['tone'] = "empathetic"
+    else:
+        memory['persona']['personality']['tone'] = "neutral"
+
+    # Save updated persona
+    with open("memory.json", 'w') as file:
+        json.dump(memory, file, indent=4)
+
+    return memory['persona']
+
+# Save Personality Growth (Updated for new table structure)
+async def save_personality_growth(key, traits, user_input, ai_response, context_tags, explanation, response_rating):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        timestamp = datetime.now().isoformat()  # Get the current timestamp
+
+        try:
+            # Check if the key already exists in the personality_growth table
+            await cursor.execute('''SELECT id FROM personality_growth WHERE key = ?''', (key,))
+            existing_record = await cursor.fetchone()
+
+            if existing_record:
+                # If the key exists, update the record with the new data
+                await cursor.execute(
+                    '''
+                    UPDATE personality_growth 
+                    SET traits = ?, 
+                        user_input = ?, 
+                        ai_response = ?, 
+                        context_tags = ?, 
+                        explanation = ?, 
+                        response_rating = ?, 
+                        timestamp = ? 
+                    WHERE key = ?
+                    ''',
+                    (traits, user_input, ai_response, context_tags, explanation, response_rating, timestamp, key)
+                )
+                await conn.commit()
+                return False  # Indicating it was an update
+            else:
+                # If the key doesn't exist, insert a new record
+                await cursor.execute(
+                    '''
+                    INSERT INTO personality_growth (
+                        key, traits, user_input, ai_response, context_tags, explanation, response_rating, timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (key, traits, user_input, ai_response, context_tags, explanation, response_rating, timestamp)
+                )
+                await conn.commit()
+                return True  # Indicating it was a new insert
+
+        except Exception as e:
+            print(f"Error saving personality growth: {e}")
+            return False
+
+async def save_emotional_growth(key, user_input, ai_response, user_emotion_score, ai_emotion_score, context_tags, explanation, response_rating):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        try:
+            # Use a unique key with a timestamp or random ID to avoid overwriting
+            unique_key = f"{key}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+            await cursor.execute('''
+                INSERT INTO emotional_growth 
+                (key, user_input, ai_response, user_emotion_score, ai_emotion_score, context_tags, explanation, response_rating)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                unique_key, user_input, ai_response, user_emotion_score, ai_emotion_score, context_tags, explanation, response_rating
+            ))
+            await conn.commit()
+        except Exception as e:
+            print(f"Error saving emotional growth: {e}")
+
+async def adjust_personality_traits(key, user_input, ai_response, user_emotion_score, ai_emotion_score, context_tags, explanation, response_rating):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        timestamp = datetime.now().isoformat()
+
+        # Load current traits from database or set defaults
+        default_traits = {"assertiveness": 0.5, "empathy": 0.5, "humor": 0.5, "openness": 0.5}
+        
+        try:
+            # Retrieve existing traits or use defaults
+            await cursor.execute('''SELECT traits FROM personality_growth WHERE key = ?''', (key,))
+            result = await cursor.fetchone()
+            if result:
+                current_traits = json.loads(result[0])
+            else:
+                current_traits = default_traits
+
+            # Log current traits before updating
+            previous_traits = current_traits.copy()
+
+            # Base emotional score weighting to influence personality growth
+            emotion_weight = (user_emotion_score + ai_emotion_score) / 2  # Average of both
+
+            # Adjust traits based on context and feedback
+            if response_rating > 0:  # Positive feedback
+                if "support" in context_tags:
+                    current_traits["empathy"] += 0.05 * emotion_weight * response_rating
+                if "conflict" in context_tags:
+                    current_traits["assertiveness"] += 0.05 * emotion_weight * response_rating
+                if "creativity" in context_tags:
+                    current_traits["humor"] += 0.05 * emotion_weight * response_rating
+                if "problem-solving" in context_tags:
+                    current_traits["openness"] += 0.05 * emotion_weight * response_rating
+            elif response_rating < 0:  # Negative feedback
+                if "support" in context_tags:
+                    current_traits["empathy"] -= 0.05 * emotion_weight * abs(response_rating)
+                if "conflict" in context_tags:
+                    current_traits["assertiveness"] -= 0.05 * emotion_weight * abs(response_rating)
+                if "creativity" in context_tags:
+                    current_traits["humor"] -= 0.05 * emotion_weight * abs(response_rating)
+                if "problem-solving" in context_tags:
+                    current_traits["openness"] -= 0.05 * emotion_weight * abs(response_rating)
+
+            # Bound traits between 0 and 1 to ensure they stay within the range
+            for trait in current_traits:
+                current_traits[trait] = max(0, min(1, current_traits[trait]))
+
+            # Save a change log before updating the database
+            await cursor.execute('''INSERT INTO personality_change_log (key, previous_traits, updated_traits, change_reason, timestamp)
+                                    VALUES (?, ?, ?, ?, ?)''',
+                                 (key, json.dumps(previous_traits), json.dumps(current_traits), explanation, timestamp))
+            await conn.commit()
+
+            # Save the updated traits back to the database
+            content = {
+                "traits": current_traits,
+                "user_input": user_input,
+                "ai_response": ai_response,
+                "context_tags": context_tags,
+                "explanation": explanation,
+                "response_rating": response_rating
+            }
+
+            # Check if 'key' exists in the database
+            await cursor.execute('''SELECT id FROM personality_growth WHERE key = ?''', (key,))
+            existing_note = await cursor.fetchone()
+            if existing_note:
+                # Update existing record
+                await cursor.execute('''UPDATE personality_growth SET content = ?, timestamp = ? WHERE key = ?''',
+                                     (json.dumps(content), timestamp, key))
+                await conn.commit()
+                return False  # Indicating it was an update
+            else:
+                # Insert new record if it doesn't exist
+                await cursor.execute('''INSERT INTO personality_growth (key, content, timestamp) VALUES (?, ?, ?)''',
+                                     (key, json.dumps(content), timestamp))
+                await conn.commit()
+                return True  # Indicating it was a new insert
+        except Exception as e:
+            print(f"Error adjusting personality traits: {e}")
+            return False
+
+# Save and Adjust Personality Traits Based on Emotional Feedback and Context
+async def adjust_personality_traits(key, user_input, ai_response, user_emotion_score, ai_emotion_score, context_tags, explanation, response_rating):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        timestamp = datetime.now().isoformat()
+
+        # Load current traits from database or set defaults
+        default_traits = {"assertiveness": 0.5, "empathy": 0.5, "humor": 0.5, "openness": 0.5}
+        
+        try:
+            # Retrieve existing traits or use defaults
+            await cursor.execute('''SELECT traits FROM personality_growth WHERE key = ?''', (key,))
+            result = await cursor.fetchone()
+            if result:
+                current_traits = json.loads(result[0])
+            else:
+                current_traits = default_traits
+
+            # Base emotional score weighting to influence personality growth
+            emotion_weight = (user_emotion_score + ai_emotion_score) / 2  # Average of both
+
+            # Adjust traits based on context and feedback
+            if response_rating > 0:  # Positive feedback
+                if "support" in context_tags:
+                    current_traits["empathy"] += 0.05 * emotion_weight * response_rating
+                if "conflict" in context_tags:
+                    current_traits["assertiveness"] += 0.05 * emotion_weight * response_rating
+                if "creativity" in context_tags:
+                    current_traits["humor"] += 0.05 * emotion_weight * response_rating
+                if "problem-solving" in context_tags:
+                    current_traits["openness"] += 0.05 * emotion_weight * response_rating
+            elif response_rating < 0:  # Negative feedback
+                if "support" in context_tags:
+                    current_traits["empathy"] -= 0.05 * emotion_weight * abs(response_rating)
+                if "conflict" in context_tags:
+                    current_traits["assertiveness"] -= 0.05 * emotion_weight * abs(response_rating)
+                if "creativity" in context_tags:
+                    current_traits["humor"] -= 0.05 * emotion_weight * abs(response_rating)
+                if "problem-solving" in context_tags:
+                    current_traits["openness"] -= 0.05 * emotion_weight * abs(response_rating)
+
+            # Bound traits between 0 and 1 to ensure they stay within the range
+            for trait in current_traits:
+                current_traits[trait] = max(0, min(1, current_traits[trait]))
+
+            # Save the updated traits back to the database
+            content = {
+                "traits": current_traits,
+                "user_input": user_input,
+                "ai_response": ai_response,
+                "context_tags": context_tags,
+                "explanation": explanation,
+                "response_rating": response_rating
+            }
+
+            # Check if 'key' exists in the database
+            await cursor.execute('''SELECT id FROM personality_growth WHERE key = ?''', (key,))
+            existing_note = await cursor.fetchone()
+            if existing_note:
+                # Update existing record
+                await cursor.execute('''UPDATE personality_growth SET content = ?, timestamp = ? WHERE key = ?''',
+                                     (json.dumps(content), timestamp, key))
+                await conn.commit()
+                return False  # Indicating it was an update
+            else:
+                # Insert new record if it doesn't exist
+                await cursor.execute('''INSERT INTO personality_growth (key, content, timestamp) VALUES (?, ?, ?)''',
+                                     (key, json.dumps(content), timestamp))
+                await conn.commit()
+                return True  # Indicating it was a new insert
+        except Exception as e:
+            print(f"Error adjusting personality traits: {e}")
+            return False
+
+# Save conversation to the database
+async def save_conversation(user_input, ai_response):
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        timestamp = datetime.now().isoformat()  # Get the current timestamp
+        try:
+            await cursor.execute('''INSERT INTO conversations (user_input, ai_response, timestamp)
+                                    VALUES (?, ?, ?)''', (user_input, ai_response, timestamp))
+            await conn.commit()
+        except Exception as e:
+            print(f"Error saving conversation: {e}")
+
+async def fix_schema():
+    async with aiosqlite.connect(db_file) as conn:
+        cursor = await conn.cursor()
+        try:
+            # Check existing columns in 'personality_growth'
+            await cursor.execute("PRAGMA table_info(personality_growth);")
+            columns = [column[1] for column in await cursor.fetchall()]
+
+            # Add the 'traits' column only if it doesn't exist
+            if 'traits' not in columns:
+                await cursor.execute("ALTER TABLE personality_growth ADD COLUMN traits TEXT;")
+                await conn.commit()
+                print("Added 'traits' column successfully.")
+            else:
+                print("'traits' column already exists.")
+        except Exception as e:
+            print(f"Error adding 'traits' column: {e}")
+
+# ============ Muziek / School / ================
+
+# A dictionary to simulate a "memory" of previous searches
+search_memory = {}
+
+# Chord progressions based on genres, moods, and tempos (modified for music theory)
+chord_progressions = {
+    "trap": {
+        "sad": [["Am", "F", "C", "G"], ["Em", "Am", "F", "C"]],
+        "angry": [["D", "A", "B", "G"], ["Cm", "Ab", "F", "G"]],
+        "melodic": [["Bm", "F#m", "A", "E"], ["Em", "C", "G", "D"]],
+    },
+    "juice_wrld": {
+        "sad": [["Cm", "Gm", "Ab", "Bb"], ["Dm", "Am", "G", "F"]],
+        "emo": [["Am", "F", "C", "G"], ["Em", "Bm", "C", "G"]],
+        "melodic": [["Gm", "Bb", "F", "C"], ["Cm", "Ab", "F", "Bb"]],
+    },
+    "hiphop": {
+        "chill": [["D", "G", "C", "F"], ["F", "C", "G", "Am"]],
+        "energetic": [["A", "D", "Bm", "G"], ["C", "Am", "G", "F"]],
+        "lyrical": [["Gm", "D", "Am", "F"], ["Em", "C", "G", "D"]],
+    },
+    "pop": {
+        "happy": [["C", "G", "Am", "F"], ["F", "C", "G", "Am"]],
+        "sad": [["Am", "F", "C", "G"], ["Em", "G", "C", "D"]],
+        "energetic": [["C", "G", "F", "C"], ["D", "A", "Bmin", "G"]],
+        "chill": [["F", "C", "Am", "G"], ["G", "D", "C", "Em"]],
+    },
+}
+
+# Function to save memory to a file for persistence
+def save_memory():
+    """Save the search memory to a file for persistence."""
+    with open("search_memory.json", "w") as f:
+        json.dump(search_memory, f)
+
+# Function to load memory from a file
+def load_memory():
+    """Load the search memory from a file if it exists."""
+    global search_memory
+    try:
+        with open("search_memory.json", "r") as f:
+            search_memory = json.load(f)
+    except FileNotFoundError:
+        search_memory = {}
+
+def collaboration_feedback(what_are_you_working_on):
+    feedback = {
+        "lyrics": "Consider adding more imagery to your lyrics to connect with your audience.",
+        "beat": "Try layering some additional percussion or vocal chops to enhance the groove.",
+        "mix": "Make sure your bass isn’t overpowering the mids. A bit of EQ adjustment could help."
+    }
+
+    return feedback.get(what_are_you_working_on, "Keep experimenting! Creativity knows no bounds.")
+
+# Example Usage:
+print(collaboration_feedback("mix"))
+
+# Placeholder function to simulate a music search
+def search_music(query):
+    # This is where you'd use an actual music API or search engine
+    print(f"Searching for music: {query}")
+    # Simulated response
+    return f"https://music.search/{query.replace(' ', '_')}"
+
+def suggest_beat_based_on_mood(mood, genre="trap"):
+    tempo_suggestions = {
+        "happy": {"trap": 140, "hiphop": 95, "pop": 120},
+        "sad": {"trap": 80, "hiphop": 85, "pop": 90},
+        "energetic": {"trap": 150, "hiphop": 120, "pop": 130},
+        "chill": {"trap": 95, "hiphop": 90, "pop": 110}
+    }
+
+    tempo = tempo_suggestions.get(mood, {}).get(genre, 100)  # Default to 100 BPM
+    return f"For a {mood} {genre} beat, try a tempo of {tempo} BPM."
+
+# Example Usage:
+print(suggest_beat_based_on_mood("sad", genre="trap"))
+
+def analyze_rhyme_quality(lyrics):
+    # Basic rhyme scheme analysis (AABB, ABAB, etc.)
+    rhyme_schemes = {
+        "AABB": "Rhymes are consistent in pairs.",
+        "ABAB": "Alternating rhyme scheme, great for keeping flow interesting.",
+        "ABC": "Interesting mix of rhymes, consider tightening up the scheme."
+    }
+
+    # Simulate rhyme scheme detection (just a mock example for now)
+    if "heart" in lyrics and "apart" in lyrics:
+        return rhyme_schemes.get("AABB", "Not enough rhyme detection.")
+    else:
+        return rhyme_schemes.get("ABAB", "Keep experimenting with the flow.")
+
+# Example Usage:
+print(analyze_rhyme_quality("I feel my heart breaking, we're falling apart."))
+
+def suggest_lyrics_based_on_theme(theme, genre="rap"):
+    lyric_themes = {
+        "heartbreak": {
+            "rap": "I can't take the pain, it's in my veins, never been the same since you left my name.",
+            "hiphop": "The love was real, but now it’s gone, I keep singing this sad song."
+        },
+        "success": {
+            "rap": "Came from the bottom, now I’m up top, never gonna stop, I made it to the top.",
+            "hiphop": "Made it through the struggle, now I’m living large, everything I touch turns to gold, I’m in charge."
+        },
+        "struggle": {
+            "rap": "Fighting demons every night, can’t escape the fight, tryna find the light.",
+            "hiphop": "Every day’s a battle, but I’m standing tall, even when the pain’s too much, I still ball."
+        }
+    }
+
+    lyrics = lyric_themes.get(theme, {}).get(genre, "No lyrics found for this theme.")
+    return lyrics
+
+# Example Usage:
+print(suggest_lyrics_based_on_theme("heartbreak", genre="hiphop"))
+
+def generate_mood_based_music(mood, genre="hiphop", key="C", scale_type="major"):
+    # Set chord progressions or generate based on mood
+    mood_based_chords = {
+        "happy": ["C", "G", "Am", "F"],  # Major chord progression
+        "sad": ["Am", "Dm", "G", "C"],   # Minor chord progression
+        "energetic": ["E", "A", "B", "C#"], # High-energy
+        "chill": ["F", "C", "Dm", "Am"],  # Laid-back vibe
+    }
+
+    progression = mood_based_chords.get(mood, ["C", "G", "Am", "F"])  # Default to "happy" chords
+    return f"Your {mood} {genre} progression in {key} {scale_type}: {' -> '.join(progression)}"
+
+# Example Usage:
+print(generate_mood_based_music("sad", genre="juice_wrld", key="Am", scale_type="minor"))
+
+# Helper function to generate chords based on music theory
+def generate_theory_based_progression(key, scale_type="major", length=4):
+    """Generate a chord progression based on music theory (scale and chord functions)."""
+    # Define major and minor scales
+    major_scale = ["I", "ii", "iii", "IV", "V", "vi", "vii°"]
+    minor_scale = ["i", "ii°", "III", "iv", "v", "VI", "VII"]
+
+    # Define the scale notes for common keys (C major, A minor, etc.)
+    scales = {
+        "C": ["C", "D", "E", "F", "G", "A", "B"],  # C Major scale
+        "G": ["G", "A", "B", "C", "D", "E", "F#"],  # G Major scale
+        "Am": ["A", "B", "C", "D", "E", "F", "G"],  # A minor scale
+        "F": ["F", "G", "A", "Bb", "C", "D", "E"],  # F Major scale
+        "D": ["D", "E", "F#", "G", "A", "B", "C#"],  # D Major scale
+    }
+
+    # Select the scale based on key and scale type (major or minor)
+    scale = scales.get(key, scales["C"])  # Default to C major if key is invalid
+    if scale_type == "minor":
+        scale = scales.get(key, scales["Am"])  # Default to A minor if scale is minor
+
+    # Select chords based on the scale
+    chord_progression = []
+    for _ in range(length):
+        chord_type = random.choice(major_scale if scale_type == "major" else minor_scale)
+        chord_root = random.choice(scale)
+        chord_progression.append(f"{chord_root} {chord_type}")
+    
+    return " -> ".join(chord_progression)
+
+# Function to generate a chord progression
+def generate_chord_progression(genre="pop", mood="happy", tempo="medium", key="C", scale_type="major"):
+    """
+    Generate chord progressions based on genre, mood, tempo, key, and scale type.
+    """
+    # Load previous memory if available
+    load_memory()
+
+    # Check if this combination has been searched before
+    search_key = f"{genre}_{mood}_{tempo}_{key}_{scale_type}"
+    if search_key in search_memory:
+        # Return a previously saved progression
+        print(f"Using previously saved progression for {search_key}.")
+        return search_memory[search_key]
+
+    # Generate progression based on music theory
+    progression = generate_theory_based_progression(key, scale_type)
+
+    # Save the new progression to memory
+    search_memory[search_key] = progression
+    save_memory()
+
+    return progression
+
+# Example usage: Generate a Juice WRLD-type progression in A minor
+print(generate_chord_progression("juice_wrld", mood="sad", key="Am", scale_type="minor"))
+
+# Example usage: Generate a Trap-style progression in C Major
+print(generate_chord_progression("trap", mood="melodic", key="C", scale_type="major"))
+
+# ============= GOOGLE API / FUNCTIONS / ===============
+
+# Global flag to control Google Search functionality
+GOOGLE_API_MODE = "online"  # Set this to "offline" to disable Google API search
+
+# Your Google API key and Custom Search Engine ID (CX)
+API_KEY = 'AIzaSyDBNrtEnjn3hPtxC9RsxkrjZguagF8hMpI'  # Replace with your actual API key
+CX = 'b45cb1fe21b4f442c'  # Replace with your custom search engine ID
+
+# Function to handle the search
+def search_query(query):
+    if GOOGLE_API_MODE == "online":
+        # Use Google API for search when online
+        return search_with_google_api(query)
+    else:
+        # Fallback to local search when offline
+        return search_with_local_db(query)
+
+# Initialize YouTube API client
+youtube = build('youtube', 'v3', developerKey=API_KEY)
+
+def extract_keywords_from_sentence(sentence):
+    # Using a basic regex to find keywords like 'type beat' or popular artist names
+    keywords = []
+    
+    # Example: Find patterns like "<artist name> type beat" or just "<genre> beat"
+    match = re.search(r"([A-Za-z\s]+)(\s+type\s+beat|\s+beat)", sentence, re.IGNORECASE)
+    if match:
+        keywords.append(match.group(1).strip())  # Add the artist or genre
+    else:
+        # If nothing matches, return the entire sentence
+        keywords.append(sentence)
+    
+    return keywords
+
+def advanced_music_search(query, filters=None):
+    """Search music with additional filters for more refined results."""
+    if filters is None:
+        filters = {"key": None, "tempo": None, "artist": None}
+    
+    # Example: Include filters in the query
+    refined_query = f"{query} in {filters.get('key', '')} with tempo {filters.get('tempo', '')} by {filters.get('artist', '')}"
+    return search_music(refined_query)
+
+# Assuming you have a function that uses sentences to search music
+def search_music_with_sentence(sentence):
+    # Convert the sentence into a music-related query
+    music_query = sentence
+    # Use the placeholder `search_music` function
+    return search_music(music_query)
+
+# Example usage
+sentence = "Find me a sad trap song"
+video_url = search_music_with_sentence(sentence)
+print(f"Video URL: {video_url}")
+
+# Function to search for music
+def search_music(query):
+    try:
+        request = youtube.search().list(
+            q=query,
+            part='snippet',
+            type='video',
+            videoCategoryId='10'  # Music category ID
+        )
+        response = request.execute()
+
+        # Ensure that there is at least one result
+        if 'items' in response and len(response['items']) > 0:
+            # Get the first video URL
+            video_url = f"https://www.youtube.com/watch?v={response['items'][0]['id']['videoId']}"
+            return video_url
+        else:
+            return "No music found for the query."
+    except googleapiclient.errors.HttpError as e:
+        print(f"HTTP error occurred: {e}")
+        return "Error while searching YouTube."
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return "Unexpected error occurred."
+
+# Example usage:
+music_query = "Can you give me a UK Nines type beat?"  # Full sentence query
+video_url = search_music(music_query)  # Pass the query as a sentence
+print(f"Suggested Video: {video_url}")
+
+# Function to handle search with Google API (online)
+def search_with_google_api(query):
+    try:
+        # Create a Google Custom Search API client
+        service = googleapiclient.discovery.build("customsearch", "v1", developerKey=API_KEY)
+
+        # Perform the search
+        response = service.cse().list(q=query, cx=CX).execute()
+
+        # Check if the response has items (search results)
+        if 'items' in response:
+            # Extract and return relevant search results from the response
+            search_results = [item['title'] + ": " + item['link'] for item in response['items']]
+            return search_results
+        else:
+            return "No results found."
+
+    except googleapiclient.errors.HttpError as e:
+        print(f"HTTP error occurred during Google Search API request: {e}")
+        return "Error with Google API search."
+    except Exception as e:
+        print(f"Error with Google API search: {e}")
+        # Fallback in case something goes wrong with the API
+        return search_with_local_db(query)
+
+# Function to handle local search (offline mode)
+def search_with_local_db(query):
+    # Implement the search logic for your local database
+    print("Searching in local database...")
+    # Example: Assuming you have a function `search_local_db` to search your trained database
+    return search_local_db(query)
+
+# Your local DB search implementation (customized)
+def search_local_db(query):
+    # This could be a SQLite query or any local search method you have
+    # For example, searching your trained model's database for relevant information
+    return f"Results for '{query}' from local database."
+
+# Sample usage:
+query = "How do I use the Google Cloud API?"
+results = search_query(query)
+print(results)
+
+# ========== Text-to-Speech (TTS) Functions ==========
+def generate_extended_chords(key, scale_type="major", genre="pop"):
+    """Generate more complex chord progressions including 7ths, 9ths, and genre-specific variations."""
+    # Example: Adding 7th chords for more advanced harmonies
+    if genre == "jazz":
+        extended_chords = ["I7", "ii7", "V7", "vi7", "bIII9"]
+    elif genre == "neo-soul":
+        extended_chords = ["I9", "IV13", "vi7", "bVII9"]
+    else:
+        extended_chords = ["I", "IV", "V", "vi"]  # Fallback simple progression
+    
+    # Use similar logic as in generate_theory_based_progression but with extended chords
+    # Could add to existing chord functions without replacing them
+    return " -> ".join(extended_chords)
+
+# Store the last interaction time (reintroduced)
+last_interaction_time = None
+
+# Initialize pygame mixer
+pygame.mixer.init()
+
+# Thread lock for synchronizing access to TTS engine
+tts_lock = threading.Lock()
+
+# TTS mode options: "offline" for pyttsx3, "online" for Google TTS
+TTS_MODE = "online"  # Choose between "offline" and "online"
+TEMP_AUDIO_FILE = tempfile.gettempdir() + "/tts_output.mp3"  # Temp file for online TTS audio
+
+# Initialize the recognizer and text-to-speech engine
+recognizer = None  # Replace with your actual recognizer setup if needed
+tts_engine = None  # Replace with pyttsx3 initialization if needed for offline TTS
+
+# Configure TTS settings (offline mode)
+tts_engine = pyttsx3.init()  # Uncomment this if you're using offline mode with pyttsx3
+tts_engine.setProperty('rate', 150)  # Speech speed
+tts_engine.setProperty('volume', 1)  # Volume (0.0 to 1.0)
+
+# Get available voices (offline)
+voices = tts_engine.getProperty('voices')
+if voices:  # Ensure voices are not empty
+    selected_voice_index = 0  # Change this index to select a different voice
+    tts_engine.setProperty('voice', voices[selected_voice_index].id)
+
+# Function to handle Google TTS in an async manner with improved naturalness
+def speak_text_online_async(text):
+    def play_audio():
+        try:
+            # Generate speech using Google TTS (set slow=False for normal speed)
+            tts = gTTS(text=text, lang='en', slow=False)
+
+            # Create a BytesIO object to hold the audio data in memory
+            audio_data = BytesIO()
+            tts.write_to_fp(audio_data)
+
+            # Rewind the BytesIO stream to the beginning
+            audio_data.seek(0)
+
+            # Load the audio from the BytesIO stream into pygame
+            sound = pygame.mixer.Sound(audio_data)
+
+            # Play the sound immediately after it is loaded
+            sound.play()
+
+        except Exception as e:
+            print(f"Error using online TTS: {e}")
+
+    # Start a new thread to handle audio playback
+    threading.Thread(target=play_audio, daemon=True).start()
+
+# Function to handle TTS with pyttsx3 (offline mode) and Google TTS (online mode)
+def speak_text(text):
+    # Stop the current TTS before playing the new one
+    pygame.mixer.stop()
+
+    if TTS_MODE == "online":
+        speak_text_online_async(text)
+    else:
+        speak_text_offline(text)
+
+# Function to handle TTS with pyttsx3 (offline mode)
+def speak_text_offline(text):
+    with tts_lock:
+        tts_engine.say(text)
+        tts_engine.runAndWait()
+
+# Flag to manage whether TTS should be interrupted
+is_interrupted = False
+
+# Main loop to handle TTS with emotional tone and interrupt feature
+def speak_text_async(text):
+    global last_interaction_time, is_interrupted
+    if text is None or text == "exit":
+        text = "Sorry, I couldn't respond properly. Please try again."  # Fallback message
+
+    print(f"Soul: {text}")  # Change from "Speaking:" to "Soul:"
+
+    # Update the last interaction time
+    last_interaction_time = time.time()
+
+    # If interrupted, stop the current TTS and play the new message
+    if is_interrupted:
+        pygame.mixer.stop()
+        is_interrupted = False  # Reset the flag
+
+    # Choose TTS mode based on the global setting
+    if TTS_MODE == "online":
+        speak_text_online_async(text)
+    else:
+        speak_text_offline(text)
+
+def tts_thread(tts_engine, tts_queue):
+    while True:
+        text = tts_queue.get()
+        if text == "exit":
+            print("Exit signal received in TTS thread.")
+            break  # Break the loop to exit the thread
+        speak_text_async(text)  # Continue processing text-to-speech
+
+# Initialize Queue for managing speech
+tts_queue = queue.Queue()
+
+# Start TTS thread
+threading.Thread(target=tts_thread, args=(tts_engine, tts_queue), daemon=True).start()
+
+# ========== Backup ==========
+
+# Function to run the backup in a background thread
+async def backup_environment():
+    # Run the backup in a background thread using asyncio.to_thread to avoid blocking
+    await asyncio.to_thread(run_backup)
+
+# Function to actually perform the backup (to be run in a background thread)
+def run_backup():
+    try:
+        # Define the source directory and backup directory
+        source_dir = "D:/SOUL.AI/"
+        backup_dir = "D:/SOUL.AIxBACKUP/"
+        
+        # Ensure the backup directory exists
+        os.makedirs(backup_dir, exist_ok=True)
+
+        # Create a timestamped backup folder name (this ensures a unique folder name for each backup)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_folder = os.path.join(backup_dir, "latest_backup")  # Use a fixed folder for the latest backup
+
+        # If the "latest_backup" folder already exists, remove it
+        if os.path.exists(backup_folder):
+            shutil.rmtree(backup_folder)
+        
+        # Create a new "latest_backup" folder to update
+        os.makedirs(backup_folder)
+
+        # Perform the backup: copy updated and new files into the backup folder
+        for item in os.listdir(source_dir):
+            source_path = os.path.join(source_dir, item)
+            backup_path = os.path.join(backup_folder, item)
+
+            # Copy files or directories
+            if os.path.isdir(source_path):
+                shutil.copytree(source_path, backup_path, dirs_exist_ok=True)  # Copy directory contents
+            else:
+                shutil.copy2(source_path, backup_path)  # Copy file, preserving metadata
+
+        print(f"Environment backup updated at: {backup_folder}")
+
+    except Exception as e:
+        print(f"Error creating environment backup: {e}")
+
+# Function to run periodic full environment backups
+async def periodic_environment_backup(interval_seconds=86400):  # e.g., every 24 hours
+    while True:
+        await backup_environment()
+        await asyncio.sleep(interval_seconds)  # Wait for the next interval
+
+# ========== Main Conversation Loop ==========
+
+async def handle_conversation():
+    global last_interaction_time
+    last_interaction_time = None
+    previous_sentiment_score = None  # Initialize as None to handle the first interaction properly
+
+    # Retrieve past conversations and user preferences
+    context = await get_past_conversations()  
+    user_preferences = await load_user_preferences()  
+    emotion_memory = deque(maxlen=5)  # Initialize emotion memory with a fixed size outside the loop
+    
+    print("Hi, I'm Soul! Type 'exit' to leave.")
+    
+    while True:
+        user_input = input("You (or press Enter to talk): ").strip()
+        current_time = datetime.now()
+
+        if last_interaction_time:
+            time_diff = (current_time - last_interaction_time).total_seconds()
+            if time_diff > 600:  # 10 minutes
+                print("Looks like you've been on a break! Welcome back!")
+                speak_text_async("Welcome back! It's great to hear from you again.")
+        
+        if user_input.lower() == "exit":
+            speak_text_async("Goodbye!")
+            print("Conversation ended.")
+            tts_queue.put("exit")  # Signal the TTS thread to stop
+            break  # Explicitly break out of the loop to end the conversation
+
+        # Handle special commands starting with "/", "remember", "recall", "emotional growth", or "personality growth"
+        if user_input and (user_input.startswith("/") or user_input.lower().startswith(("remember ", "recall ", "emotional growth ", "personality growth "))):
+            try:
+                # Command parsing
+                if user_input.startswith("/"):
+                    await handle_user_input(user_input, context)  # Handle mode switching
+                elif user_input.lower().startswith("remember "):
+                    # Save a note
+                    content = user_input[9:].strip()
+                    key = content.split(' ', 1)[0].lower()  # Use the first word as the key
+                    await save_note(key, content)
+                    speak_text_async(f"I'll remember that {key} means {content}.")
+                elif user_input.lower().startswith("recall "):
+                    # Retrieve a note
+                    key = user_input[7:].strip().lower()
+                    note = await retrieve_note(key)
+                    if note:
+                        speak_text_async(f"You asked me to remember: {note}")
+                    else:
+                        speak_text_async(f"Sorry, I don't remember anything about '{key}'.")
+                elif user_input.lower().startswith("emotional growth "):
+                    # Save emotional growth
+                    content = user_input[17:].strip()  # Adjust the slice accordingly
+                    key = "emotional_growth"  
+                    await save_emotional_growth(key, content)
+                    speak_text_async(f"I've saved this emotional growth update: {content}")
+                elif user_input.lower().startswith("personality growth "):
+                    # Save personality growth
+                    content = user_input[18:].strip()  
+                    key = "personality_growth"  
+                    await save_personality_growth(key, content)
+                    speak_text_async(f"I've saved this personality growth update: {content}")
+            except Exception as e:
+                print(f"Error during special command processing: {e}")
+                speak_text_async("Sorry, something went wrong. Please try again.")
+            continue  # Skip the AI response generation after handling commands
+
+        # Handle voice input if no user input is provided
+        if not user_input:
+            print("Listening for your voice input...")
+            await listen_to_speech(handle_speech_input)  # Non-blocking listening
+            continue  # Continue to wait for the next input
+
+        try:
+            # Analyze the sentiment of user input
+            sentiment_score = analyze_sentiment(user_input)
+            adjusted_sentiment_score = categorize_emotion(sentiment_score, emotion_memory)
+
+            # Generate an AI response based on context
+            ai_response = await get_ai_response(user_input, context)
+            empathic_ai_response = empathic_response(user_input, ai_response, adjusted_sentiment_score, user_preferences)
+
+            # Ensure the empathic response is valid, with fallback if None
+            if empathic_ai_response:
+                speak_text_async(empathic_ai_response)
+            else:
+                fallback_response = "Sorry, I couldn't process that."
+                speak_text_async(fallback_response)
+
+            # Update context with user input and AI response
+            context += f"\nUser: {user_input}\nAI: {empathic_ai_response or fallback_response}"
+
+            # Save the conversation
+            await save_conversation(user_input, empathic_ai_response or fallback_response)
+
+            # Track emotional and personality growth
+            await track_emotional_growth(user_input, empathic_ai_response or fallback_response)
+            await track_personality_growth(user_input, empathic_ai_response or fallback_response, adjusted_sentiment_score, context)
+
+            # Update emotion memory
+            emotion_memory.append(adjusted_sentiment_score)
+
+            # Update memory with user input, AI response, and user preferences
+            await update_memory(user_input, empathic_ai_response or fallback_response, user_preferences, emotion_memory)
+
+        except Exception as e:
+            print(f"Error during conversation processing: {e}")
+            speak_text_async("Sorry, something went wrong. Please try again.")
+
+        last_interaction_time = current_time
+
+# ========== Main Entry Point ==========
+
+async def main():
+    await initialize()  # Ensure the database is set up
+    await handle_conversation()  # Run the main conversation loop
+
+# Initialization of environment
+async def initialize():
+    asyncio.create_task(periodic_environment_backup(interval_seconds=86400))
+    await create_db()
+    await create_all_tables()
+
+if __name__ == "__main__":
+    asyncio.run(main())

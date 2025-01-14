@@ -1,0 +1,13 @@
+/empathy to get empathetic responses (using Llama3.2).
+/creative to get more creative responses (using Llama2-Uncensored).
+
+Quick Notes:
+remember [key] [content]: Saves or updates a note by the given key.
+recall [key]: Retrieves the content of the note by the given key.
+list notes: Lists all note keys stored in the system.
+
+Genre: You specify the genre you want (e.g., "trap", "juice_wrld", "hiphop", "pop").
+Mood: You specify the mood (e.g., "happy", "sad", "energetic", "melodic").
+Tempo: You specify the tempo (e.g., "slow", "medium", "fast"). This will influence how the chords are grouped but doesn't drastically change the progression in this version.
+Key: You specify the key of the progression (e.g., "C", "G", "Am").
+Scale Type: You specify whether you want a major or minor scale.
