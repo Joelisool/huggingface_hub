@@ -1915,3 +1915,29 @@ async def initialize():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# Add this class before the main code
+class ECHOModel:
+    def __init__(self):
+        self.llm = OllamaLLM(model="llama2")
+        
+    async def load_model(model_type):
+        if model_type == "image_generation":
+            return StableDiffusionPipeline.from_pretrained(
+                "CompVis/stable-diffusion-v1-4",
+                torch_dtype=torch.float16
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
+        return None
+        
+    def generate(self, prompt):
+        try:
+            response = self.llm(prompt)
+            return response
+        except Exception as e:
+            print(f"Error generating response: {e}")
+            return "I apologize, but I'm having trouble processing that right now."
+
+    async def forward(self, inputs):
+        return self.generate(inputs["text"][0])
+
+# ...existing code...
