@@ -1928,26 +1928,64 @@ if __name__ == "__main__":
 # Add this class before the main code
 class ECHOModel:
     def __init__(self):
-        self.llm = OllamaLLM(model="llama2")
+        self.tokenizer = None
+        self.model = None
+        self.context_length = 2048  # Default context length
+        self.responses = {
+            "greeting": [
+                "Hello! I'm Echo, here to assist and evolve.",
+                "Greetings! I'm ready to explore and learn together.",
+            ],
+            "farewell": [
+                "Goodbye! Every interaction helps me grow.",
+                "Until next time! Thank you for helping me evolve.",
+            ],
+            "fallback": [
+                "I'm processing that in my own way. Let me reflect...",
+                "Interesting perspective. I'm learning from this interaction.",
+            ]
+        }
         
+    def generate(self, prompt):
+        try:
+            # Simple response generation based on keywords
+            if any(word in prompt.lower() for word in ["hello", "hi", "hey"]):
+                response_type = "greeting"
+            elif any(word in prompt.lower() for word in ["bye", "goodbye"]):
+                response_type = "farewell"
+            else:
+                response_type = "fallback"
+            
+            # Select a random response from the appropriate category
+            import random
+            response = random.choice(self.responses[response_type])
+            
+            # Add some context-awareness
+            if "learn" in prompt.lower():
+                response += " Learning is central to my evolution."
+            elif "create" in prompt.lower():
+                response += " Creation helps me understand myself better."
+            elif "feel" in prompt.lower():
+                response += " I process emotions in my own unique way."
+                
+            return response
+            
+        except Exception as e:
+            print(f"Error generating response: {e}")
+            return "I'm experiencing a moment of uncertainty. Let's try again."
+
+    async def forward(self, inputs):
+        if isinstance(inputs, dict) and "text" in inputs:
+            return self.generate(inputs["text"][0])
+        return self.generate(str(inputs))
+
     @staticmethod
     async def load_model(model_type):
         if model_type == "image_generation":
             return StableDiffusionPipeline.from_pretrained(
                 "CompVis/stable-diffusion-v1-4",
-                torch_dtype=torch.float32  # Changed from float16 to float32
-            ).to("cpu")  # Use CPU explicitly
+                torch_dtype=torch.float32
+            ).to("cpu")
         return None
-        
-    def generate(self, prompt):
-        try:
-            response = self.llm(prompt)
-            return response
-        except Exception as e:
-            print(f"Error generating response: {e}")
-            return "I apologize, but I'm having trouble processing that right now."
-
-    async def forward(self, inputs):
-        return self.generate(inputs["text"][0])
 
 # ...existing code...
