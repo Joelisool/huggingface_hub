@@ -1,5 +1,3 @@
-import nltk
-nltk.download('wordnet')
 import os
 import pyttsx3
 from textblob import TextBlob
@@ -1429,7 +1427,7 @@ image_generator = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffus
 image_generator.safety_checker = None  # Disabling the safety checker
 
 # Move the model to GPU
-image_generator = image_generator.to("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available, otherwise CPU
+image_generator = image_generator.to("cuda" if torch.cuda.is_available() else "gpu")  # Use GPU if available, otherwise CPU
 
 # Target directory for saving the generated content
 target_directory = os.path.join(os.getcwd(), ".workspace/gen")
@@ -1928,7 +1926,7 @@ class ECHOModel:
             return StableDiffusionPipeline.from_pretrained(
                 "CompVis/stable-diffusion-v1-4",
                 torch_dtype=torch.float16
-            ).to("cuda" if torch.cuda.is_available() else "cpu")
+            ).to("cuda" if torch.cuda.is_available() else "gpu")
         return None
         
     def generate(self, prompt):
