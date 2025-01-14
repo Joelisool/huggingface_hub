@@ -39,6 +39,9 @@ import googleapiclient.errors
 import googleapiclient.discovery
 from googleapiclient.discovery import build
 
+import os
+os.environ['SDL_AUDIODRIVER'] = 'dummy'
+
 # # = # # = E-C-H-O  / E - Evolution / C - Creation / H - Harmoney / O - Oppurtunity / # # = # # =
 
 current_mode = "empathy"  # Default mode when the application starts
