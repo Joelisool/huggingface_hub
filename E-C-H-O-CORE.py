@@ -1,3 +1,5 @@
+import nltk
+nltk.download('wordnet')
 import os
 import pyttsx3
 from textblob import TextBlob
@@ -38,7 +40,7 @@ from moviepy.editor import ImageSequenceClip, AudioFileClip
 import googleapiclient.errors
 import googleapiclient.discovery
 from googleapiclient.discovery import build
- 
+
 # # = # # = E-C-H-O  / E - Evolution / C - Creation / H - Harmoney / O - Oppurtunity / # # = # # =
 
 current_mode = "empathy"  # Default mode when the application starts
